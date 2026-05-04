@@ -95,3 +95,12 @@ pepe-agent/
 |---|---|
 | `ELEVENLABS_API_KEY` | Your ElevenLabs API key (server-side only) |
 | `ELEVENLABS_AGENT_ID` | Agent ID from the ElevenLabs dashboard |
+
+### Live Board feed
+
+The dot-matrix live board pulls real-time activity through `/api/feed` (SSE bridge over a per-request WebSocket; REST polling fallback). Both env vars below have safe defaults that point at `data.cmem.ai`, so the route works without any configuration in preview environments.
+
+| Variable | Description | Default |
+|---|---|---|
+| `ACTIVITY_WS_UPSTREAM_URL` | Upstream WebSocket the feed route subscribes to | `wss://data.cmem.ai/activity` |
+| `ACTIVITY_REST_FALLBACK_URL` | REST endpoint polled at 1.5s when the WS is unavailable | `https://data.cmem.ai/api/activity/top/50` |
