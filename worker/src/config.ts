@@ -1,3 +1,4 @@
+import path from "node:path";
 import { z } from "zod";
 
 // Boot-required: worker refuses to start without these.
@@ -15,7 +16,10 @@ const BootSchema = z.object({
   MEMEDECK_JUPITER_PROXY_URL: z.string().url().optional(),
   CLAUDE_MEM_PLUGIN_ROOT: z.string().optional(),
   CLAUDE_MEM_WORKER_PORT: z.coerce.number().int().positive().optional(),
+  CLAUDE_MEM_WORKER_URL: z.string().url().optional(),
   AGENT_WALLET_PRIVATE_KEY_BASE58: z.string().optional(),
+  MEMORY_TICK_MS: z.coerce.number().int().positive().default(5000),
+  WORKING_DIR: z.string().default(path.resolve(process.cwd(), "..")),
 });
 
 export type BootConfig = z.infer<typeof BootSchema>;
