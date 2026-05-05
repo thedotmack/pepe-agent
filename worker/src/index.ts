@@ -8,6 +8,8 @@ import { startMemoryTick } from "./memory/tick.ts";
 import { createAgentLoop } from "./agent/loop.ts";
 import { openLedger } from "./trade/ledger.ts";
 import { tryGetPublicKey } from "./trade/wallet.ts";
+import { createStateStore, type FeedStatus } from "./state.ts";
+import type { SubscriberStatus } from "./activity/subscriber.ts";
 
 const log = createLogger("boot");
 
@@ -34,7 +36,17 @@ async function main() {
     );
   }
 
-  const server = startWorkerServer();
+  // Phase 5: kill switch + state store (created up front so the worker server
+  // can serve /state and /kill from boot, even before the agent loop starts).
+  const killSwitchRef = { tripped: false };
+  const stateStore = createStateStore({
+    ledger,
+    killSwitchRef,
+    contentSessionId: null,
+    walletPubkey: walletPubkey ?? null,
+  });
+
+  const server = startWorkerServer({ stateStore, killSwitchRef });
 
   // claude-mem client. Health-check on boot but never crash if it's down —
   // the worker still serves /healthz and accepts chat without memory.
@@ -50,6 +62,7 @@ async function main() {
 
   // Mint a fresh contentSessionId for this cold boot. Never persist across restarts.
   const contentSessionId = mintContentSessionId();
+  stateStore.setSessionId(contentSessionId);
   if (memHealthy) {
     try {
       await memClient.initSession({
@@ -67,16 +80,22 @@ async function main() {
 
   // Activity subscriber: wss → in-memory map → 1Hz emitter.
   const subscriber = createActivitySubscriber();
-  subscriber.emitter.on("status", ({ status }) => {
+  subscriber.emitter.on("status", ({ status }: { status: SubscriberStatus }) => {
     log.info(`activity status → ${status}`);
+    // Map subscriber's "idle" → "connecting" for the public FeedStatus surface.
+    const mapped: FeedStatus = status === "idle" ? "connecting" : status;
+    stateStore.setFeedStatus(mapped);
   });
 
   // Memory tick: 5s digest pulled from the subscriber's latest snapshot.
   const tick = startMemoryTick({ subscriber, client: memClient });
 
+  // Phase 5: 500ms tick to drive the state machine's idle/grace timers.
+  const stateTick = setInterval(() => stateStore.tick(Date.now()), 500);
+  stateTick.unref();
+
   // Agent loop (Phase 3). Boots only if ANTHROPIC_API_KEY is set; otherwise
   // the worker still serves subscribers + memory tick.
-  const killSwitchRef = { tripped: false };
   let agent: ReturnType<typeof createAgentLoop> | null = null;
   if (config.ANTHROPIC_API_KEY) {
     try {
@@ -86,6 +105,7 @@ async function main() {
         ledger,
         memClient,
         contentSessionId,
+        stateStore,
       });
       agent.emitter.on("assistantText", (text: string) => {
         log.info(`[agent] ${text.slice(0, 200)}`);
@@ -108,6 +128,7 @@ async function main() {
   const shutdown = async (signal: string) => {
     log.warn(`received ${signal}, shutting down`);
     if (agent) agent.stop();
+    clearInterval(stateTick);
     tick.stop();
     subscriber.stop();
     await server.close();

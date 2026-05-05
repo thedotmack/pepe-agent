@@ -20,6 +20,7 @@ import { DEFAULT_SLIPPAGE_BPS, SLIPPAGE_HARD_CAP_BPS, PER_TRADE_MAX_SOL } from "
 import type { TradeLedger } from "../../trade/ledger.ts";
 import { executeTrade, getQuote as jupGetQuote } from "../../trade/jupiter.ts";
 import type { ClaudeMemClient } from "../../memory/claude-mem-client.ts";
+import type { StateStore } from "../../state.ts";
 import { createLogger } from "../../logger.ts";
 
 const log = createLogger("agent.tools");
@@ -33,6 +34,7 @@ export interface CreatePepeMcpServerArgs {
   ledger: TradeLedger;
   memClient: ClaudeMemClient;
   contentSessionId: string;
+  stateStore: StateStore;
 }
 
 const SignalEnum = z.enum(["STRONG", "RISING", "WATCH", "FLAT"]);
@@ -54,6 +56,7 @@ export function createPepeMcpServer(
     ledger,
     memClient,
     contentSessionId,
+    stateStore,
   } = args;
 
   const getTopTokens = tool(
@@ -141,9 +144,19 @@ export function createPepeMcpServer(
       reason: z.string().min(8),
     },
     async (input) => {
+      // Phase 5: flash dot-matrix during the attempt — flip BEFORE policy check.
+      stateStore.setPhase("TRADING");
+
       // Defense-in-depth: even if hook + canUseTool somehow let this through,
       // the handler re-checks the policy.
       if (killSwitchRef.tripped) {
+        stateStore.recordDecision({
+          ts: Date.now(),
+          symbol: "?",
+          action: "PASS",
+          reason: "kill switch tripped",
+        });
+        stateStore.setPhase("WATCHING");
         return {
           content: [{ type: "text", text: "denied: kill switch is tripped" }],
           isError: true,
@@ -158,6 +171,13 @@ export function createPepeMcpServer(
       };
       const decision = tradePolicyCheck(intent);
       if (!decision.allow) {
+        stateStore.recordDecision({
+          ts: Date.now(),
+          symbol: "?",
+          action: "PASS",
+          reason: decision.reason,
+        });
+        stateStore.setPhase("WATCHING");
         return {
           content: [{ type: "text", text: `denied: ${decision.reason}` }],
           isError: true,
@@ -177,6 +197,13 @@ export function createPepeMcpServer(
         executedPriceSolPerToken = result.executedPriceSolPerToken;
       } catch (err) {
         log.error(`submit_trade execute failed: ${String(err)}`);
+        stateStore.recordDecision({
+          ts: Date.now(),
+          symbol: input.tokenOut.slice(0, 8),
+          action: "PASS",
+          reason: `execute-failed: ${String(err)}`,
+        });
+        stateStore.setPhase("WATCHING");
         return {
           content: [
             { type: "text", text: `execute-failed: ${String(err)}` },
@@ -201,6 +228,16 @@ export function createPepeMcpServer(
         entryPriceSolPerToken: executedPriceSolPerToken ?? 0,
         sizeSol: input.amountSol,
       });
+
+      // Phase 5: record the decision in the state store for the dot-matrix
+      // log; symbol extraction is a stub — agent's reason text matters more.
+      stateStore.recordDecision({
+        ts: Date.now(),
+        symbol: input.tokenOut.slice(0, 8),
+        action: "BUY",
+        reason: input.reason,
+      });
+      stateStore.setSelectedToken(input.tokenOut);
 
       // Record the decision in claude-mem so future sessions see it
       // (plan Phase 4 step 5, line 388).
@@ -237,6 +274,13 @@ export function createPepeMcpServer(
     async ({ tokenId, action, symbol, entryPriceSolPerToken, sizeSol, reason }) => {
       if (action === "close") {
         ledger.closePosition(tokenId);
+        stateStore.recordDecision({
+          ts: Date.now(),
+          symbol: symbol ?? tokenId.slice(0, 8),
+          action: "SELL",
+          reason,
+        });
+        stateStore.setSelectedToken(null);
         return { content: [{ type: "text", text: `closed ${tokenId} (${reason})` }] };
       }
       if (entryPriceSolPerToken === undefined || sizeSol === undefined) {
@@ -256,6 +300,7 @@ export function createPepeMcpServer(
         entryPriceSolPerToken,
         sizeSol,
       });
+      stateStore.setSelectedToken(tokenId);
       return { content: [{ type: "text", text: `opened ${tokenId} (${reason})` }] };
     }
   );

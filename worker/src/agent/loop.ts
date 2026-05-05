@@ -39,10 +39,14 @@ import {
   type PolicyContext,
 } from "../trade/policy.ts";
 import { createTradePolicyHook } from "./hooks.ts";
+import type { StateStore } from "../state.ts";
 
 const log = createLogger("agent.loop");
 
 const PEPE_TRADE_TOOL = "mcp__pepe__submit_trade";
+
+// Heuristic: assistant says it's calling/watching/checking $SYM → CALLING.
+const CALLING_REGEX = /\b(calling|looking at|watching|checking)\s+\$?([A-Z0-9]{2,10})/i;
 
 export interface CreateAgentLoopArgs {
   subscriber: ActivitySubscriber;
@@ -50,6 +54,7 @@ export interface CreateAgentLoopArgs {
   ledger: TradeLedger;
   memClient: ClaudeMemClient;
   contentSessionId: string;
+  stateStore: StateStore;
 }
 
 export interface AgentLoopHandle {
@@ -81,7 +86,7 @@ function extractAssistantText(msg: SDKMessage): string | null {
 }
 
 export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { start: () => void } {
-  const { subscriber, killSwitchRef, ledger, memClient, contentSessionId } = args;
+  const { subscriber, killSwitchRef, ledger, memClient, contentSessionId, stateStore } = args;
 
   const outbound = new EventEmitter();
   outbound.setMaxListeners(50);
@@ -149,6 +154,7 @@ export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { 
         ledger,
         memClient,
         contentSessionId,
+        stateStore,
       }),
     },
     hooks: {
@@ -188,9 +194,24 @@ export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { 
             if (message.type === "assistant") {
               const text = extractAssistantText(message);
               if (text) {
+                const match = CALLING_REGEX.exec(text);
+                if (match) {
+                  stateStore.setPhase("CALLING");
+                  const sym = match[2].toUpperCase();
+                  const hit = subscriber
+                    .getSnapshot()
+                    .find((t) => t.symbol?.toUpperCase() === sym);
+                  if (hit) stateStore.setSelectedToken(hit.tokenId);
+                } else if (stateStore.snapshot().phase === "IDLE") {
+                  stateStore.setPhase("WATCHING");
+                }
                 outbound.emit("assistantText", text);
               }
             } else if (message.type === "result") {
+              // Active turn ended: fall back to WATCHING (tick will idle out).
+              if (stateStore.snapshot().phase !== "TRADING") {
+                stateStore.setPhase("WATCHING");
+              }
               outbound.emit("result", message);
             } else if (message.type === "system") {
               const sys = message as { subtype?: string; mcp_servers?: { name: string; status: string }[] };

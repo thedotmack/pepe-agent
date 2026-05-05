@@ -15,6 +15,8 @@ export type FeedStatus =
   | "rest-fallback"
   | "stale";
 
+export type AgentPhase = "IDLE" | "WATCHING" | "CALLING" | "TRADING";
+
 const {
   createMatrix,
   drawDottedField,
@@ -48,6 +50,10 @@ export type RenderBoardOptions = {
   draft?: string;
   /** True when chat input has focus / cursor blink */
   cursorOn?: boolean;
+  /** Phase 5: agent state machine phase, authoritative on the worker. */
+  agentPhase?: AgentPhase;
+  /** Phase 5: kill switch tripped — overrides agentPhase to STOPPED amber. */
+  killSwitch?: boolean;
 };
 
 export type RenderBoardResult = {
@@ -74,6 +80,36 @@ function statusTone(status: FeedStatus): Tone {
     case "connecting":
       return "blue";
     case "stale":
+    default:
+      return "dim";
+  }
+}
+
+function agentLabel(phase: AgentPhase, killSwitch: boolean): string {
+  if (killSwitch) return "STOP";
+  switch (phase) {
+    case "WATCHING":
+      return "WATCH";
+    case "CALLING":
+      return "CALL";
+    case "TRADING":
+      return "TRADE";
+    case "IDLE":
+    default:
+      return "IDLE";
+  }
+}
+
+function agentTone(phase: AgentPhase, killSwitch: boolean): Tone {
+  if (killSwitch) return "amber";
+  switch (phase) {
+    case "WATCHING":
+      return "cyan";
+    case "CALLING":
+      return "amber";
+    case "TRADING":
+      return "white";
+    case "IDLE":
     default:
       return "dim";
   }
@@ -279,6 +315,14 @@ function renderMobile(rows: ActivityToken[], opts: RenderBoardOptions): RenderBo
     active: opts.status === "live",
     width: 21,
   });
+  // Phase 5: AGENT phase badge under the status badge
+  const agentPhaseM = opts.agentPhase ?? "IDLE";
+  const killM = opts.killSwitch ?? false;
+  drawBadge(m, 84, 9, agentLabel(agentPhaseM, killM), {
+    tone: agentTone(agentPhaseM, killM),
+    active: agentPhaseM === "CALLING" || agentPhaseM === "TRADING" || killM,
+    width: 21,
+  });
   drawText(m, `${formatSol(opts.walletSol ?? 4.21)} SOL`, 5, 16, {
     font: "sm",
     tone: "white",
@@ -462,6 +506,15 @@ function renderDesktop(rows: ActivityToken[], opts: RenderBoardOptions): RenderB
     active: opts.status === "live",
     width: 26,
   });
+  // Phase 5: AGENT phase badge to the left of the FEED badge.
+  const agentPhaseD = opts.agentPhase ?? "IDLE";
+  const killD = opts.killSwitch ?? false;
+  drawBadge(m, DESK_COLS - 60, 0, agentLabel(agentPhaseD, killD), {
+    tone: agentTone(agentPhaseD, killD),
+    active:
+      agentPhaseD === "CALLING" || agentPhaseD === "TRADING" || killD,
+    width: 26,
+  });
 
   // ── Activity table ────────────────────────────────────────────────────────
   // Table border panel
@@ -500,11 +553,19 @@ function renderDesktop(rows: ActivityToken[], opts: RenderBoardOptions): RenderB
     visible.forEach((t, i) => {
       const y = DESK_TABLE_FIRST_ROW + i * DESK_ROW_HEIGHT;
       const active = t.tokenId === opts.selectedTokenId;
+      // Phase 5: pulse the active row amber while TRADING.
+      const tradingFlash =
+        active && opts.agentPhase === "TRADING"
+          ? 0.5 + 0.5 * Math.abs(Math.sin(phase * Math.PI))
+          : 0;
       if (active) {
         // Row highlight bar
+        const tone: Tone = tradingFlash > 0 ? "amber" : "cyan";
+        const lvlTop = tradingFlash > 0 ? 0.3 + 0.4 * tradingFlash : 0.18;
+        const lvlBot = tradingFlash > 0 ? 0.2 + 0.3 * tradingFlash : 0.12;
         for (let bx = tx - 1; bx < tx + DESK_TABLE_W - 2; bx += 1) {
-          setDot(m, bx, y - 1, "cyan", 0.18);
-          setDot(m, bx, y + DESK_ROW_HEIGHT - 3, "cyan", 0.12);
+          setDot(m, bx, y - 1, tone, lvlTop);
+          setDot(m, bx, y + DESK_ROW_HEIGHT - 3, tone, lvlBot);
         }
       }
 

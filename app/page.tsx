@@ -7,7 +7,7 @@ import { DotMatrixCanvas } from "@/components/dot-board/DotMatrixCanvas";
 import { useActivityStream } from "@/lib/activity/use-activity-stream";
 import { useActivityStore } from "@/lib/activity/activity-store";
 import type { ActivityToken } from "@/lib/activity/activity-websocket";
-import type { FeedStatus } from "@/lib/dot-matrix/render-board";
+import type { AgentPhase, FeedStatus } from "@/lib/dot-matrix/render-board";
 import { renderBoard, type ChatLogEntry } from "@/lib/dot-matrix/render-board";
 import { DOT_BOARD, DOT_BOARD_DESKTOP } from "@/lib/dot-matrix/dot-matrix-ui-kit";
 
@@ -15,6 +15,20 @@ const PIXEL = DOT_BOARD.dotSize + DOT_BOARD.gap;
 const SCREEN_MARGIN = 24;
 
 type SessionKind = "idle" | "text" | "voice";
+
+type AgentStateSnapshot = {
+  phase: AgentPhase;
+  selectedTokenId: string | null;
+  callingSinceMs: number | null;
+  walletSol: number;
+  pnlUsd: number;
+  openPositions: number;
+  killSwitch: boolean;
+  feedStatus: FeedStatus;
+  walletPubkey: string | null;
+  sessionId: string | null;
+  lastDecisionLog: Array<{ ts: number; symbol: string; action: string; reason: string }>;
+};
 
 const DEMO_ROWS: ActivityToken[] = [
   { tokenId: "mog", symbol: "MOG", name: "Mog", price: 0.00012, fiveMinGain: 0.44, buyPressure5m: 0.9, liquidity: 112000, updatesPerMinute: 48, signal: "STRONG" },
@@ -158,6 +172,32 @@ export default function HomePage() {
   const beamPhase = (tick % 10) / 10;
   const cursorOn = inputFocused && tick % 4 < 2;
 
+  // ── Phase 5: poll worker /state every 500ms via the Next.js proxy ──────────
+  // Browser never sees the shared secret; the route handler reads it server-side.
+  const [agentState, setAgentState] = useState<AgentStateSnapshot | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch("/api/agent/state", { cache: "no-store" });
+        if (!res.ok) {
+          if (!cancelled) setAgentState(null);
+          return;
+        }
+        const json = (await res.json()) as AgentStateSnapshot;
+        if (!cancelled) setAgentState(json);
+      } catch {
+        if (!cancelled) setAgentState(null);
+      }
+    };
+    void poll();
+    const id = setInterval(poll, 500);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
   const demoRows = useMemo<ActivityToken[]>(
     () =>
       DEMO_ROWS.map((row, index) => {
@@ -184,10 +224,18 @@ export default function HomePage() {
   );
 
   const selectedTokenId = useMemo(() => {
+    // When the worker has an active agent (any non-IDLE phase), prefer its
+    // selectedTokenId. Otherwise keep the demo scanner running.
+    if (agentState && agentState.phase !== "IDLE" && agentState.selectedTokenId) {
+      return agentState.selectedTokenId;
+    }
     if (boardRows.length === 0) return undefined;
     const index = Math.floor(tick / 10) % boardRows.length;
     return boardRows[index]?.tokenId;
-  }, [boardRows, tick]);
+  }, [agentState, boardRows, tick]);
+
+  const agentPhase: AgentPhase = agentState?.phase ?? "IDLE";
+  const killSwitch = agentState?.killSwitch ?? false;
 
   // ── Layout selection + responsive scale ───────────────────────────────────
   const [layout, setLayout] = useState<"mobile" | "desktop">("mobile");
@@ -237,8 +285,27 @@ export default function HomePage() {
         chat: chatMessages,
         draft,
         cursorOn,
+        agentPhase,
+        killSwitch,
+        walletSol: agentState?.walletSol,
+        pnlUsd: agentState?.pnlUsd,
       }),
-    [boardRows, feedStatus, selectedTokenId, isSpeaking, transcript, beamPhase, layout, chatMessages, draft, cursorOn],
+    [
+      boardRows,
+      feedStatus,
+      selectedTokenId,
+      isSpeaking,
+      transcript,
+      beamPhase,
+      layout,
+      chatMessages,
+      draft,
+      cursorOn,
+      agentPhase,
+      killSwitch,
+      agentState?.walletSol,
+      agentState?.pnlUsd,
+    ],
   );
 
   const { matrix, pepeFrame, chatInputFrame, cols: boardCols, rows: boardRowsCount } = result;
