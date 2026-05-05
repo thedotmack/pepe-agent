@@ -16,7 +16,8 @@
     "ogl": "1.0.11",
     "react": "19.2.5",
     "react-dom": "19.2.5",
-    "ws": "^8.20.0"
+    "ws": "^8.20.0",
+    "zustand": "^5.0.13"
   },
   "devDependencies": {
     "@playwright/test": "^1.59.1",

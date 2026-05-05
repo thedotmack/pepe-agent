@@ -6,10 +6,14 @@ import {
   type Matrix,
   type Tone,
 } from "./dot-matrix-ui-kit";
-import type {
-  ActivityToken,
-  FeedStatus,
-} from "@/components/dot-board/use-activity-feed";
+import type { ActivityToken } from "@/lib/activity/activity-websocket";
+
+export type FeedStatus =
+  | "connecting"
+  | "live"
+  | "reconnecting"
+  | "rest-fallback"
+  | "stale";
 
 const {
   createMatrix,

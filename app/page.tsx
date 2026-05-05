@@ -4,10 +4,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, FormEvent } from "re
 import PepeHead from "@/components/pepe-head/PepeHead";
 import { PepeAgent, AgentStatus, type ChatMessage } from "@/lib/agent";
 import { DotMatrixCanvas } from "@/components/dot-board/DotMatrixCanvas";
-import {
-  useActivityFeed,
-  type ActivityToken,
-} from "@/components/dot-board/use-activity-feed";
+import { useActivityStream } from "@/lib/activity/use-activity-stream";
+import { useActivityStore } from "@/lib/activity/activity-store";
+import type { ActivityToken } from "@/lib/activity/activity-websocket";
+import type { FeedStatus } from "@/lib/dot-matrix/render-board";
 import { renderBoard, type ChatLogEntry } from "@/lib/dot-matrix/render-board";
 import { DOT_BOARD, DOT_BOARD_DESKTOP } from "@/lib/dot-matrix/dot-matrix-ui-kit";
 
@@ -134,8 +134,20 @@ export default function HomePage() {
 
   const isSpeaking = status === "speaking";
 
-  // ── Activity feed ──────────────────────────────────────────────────────────
-  const { rows, status: feedStatus } = useActivityFeed();
+  // ── Activity feed (Zustand-backed, direct WS to api.memedeck.win) ─────────
+  useActivityStream();
+  const rows = useActivityStore((s) => s.tokens);
+  const connectionState = useActivityStore((s) => s.connectionState);
+  const lastUpdated = useActivityStore((s) => s.lastUpdated);
+  const feedStatus: FeedStatus = useMemo(() => {
+    if (connectionState === "connected") {
+      const stale = lastUpdated > 0 && Date.now() - lastUpdated > 15_000;
+      return stale ? "stale" : "live";
+    }
+    if (connectionState === "connecting") return "connecting";
+    if (connectionState === "error") return "rest-fallback";
+    return "reconnecting";
+  }, [connectionState, lastUpdated]);
 
   // ── Beam pulse + cursor blink tick (200ms) ─────────────────────────────────
   const [tick, setTick] = useState(0);
