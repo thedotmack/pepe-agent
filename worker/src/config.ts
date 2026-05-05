@@ -12,7 +12,12 @@ const BootSchema = z.object({
   SOLANA_NETWORK: z.enum(["devnet", "mainnet-beta", "testnet"]).default("devnet"),
   SOLANA_RPC_URL: z.string().url().optional(),
   ANTHROPIC_API_KEY: z.string().optional(),
+  ANTHROPIC_MODEL: z.string().default("claude-sonnet-4-6"),
   ANTHROPIC_BASE_URL: z.string().url().optional(),
+  AGENT_MAX_BUDGET_USD: z.coerce.number().positive().default(5),
+  CLAUDE_PLUGIN_ROOT: z
+    .string()
+    .default("/Users/alexnewman/.claude/plugins/cache/thedotmack/claude-mem/12.6.0"),
   MEMEDECK_JUPITER_PROXY_URL: z.string().url().optional(),
   CLAUDE_MEM_PLUGIN_ROOT: z.string().optional(),
   CLAUDE_MEM_WORKER_PORT: z.coerce.number().int().positive().optional(),

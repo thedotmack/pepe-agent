@@ -5,6 +5,7 @@ import { createActivitySubscriber } from "./activity/subscriber.ts";
 import { createClaudeMemClient } from "./memory/claude-mem-client.ts";
 import { mintContentSessionId } from "./memory/session.ts";
 import { startMemoryTick } from "./memory/tick.ts";
+import { createAgentLoop } from "./agent/loop.ts";
 
 const log = createLogger("boot");
 
@@ -54,8 +55,34 @@ async function main() {
   // Memory tick: 5s digest pulled from the subscriber's latest snapshot.
   const tick = startMemoryTick({ subscriber, client: memClient });
 
+  // Agent loop (Phase 3). Boots only if ANTHROPIC_API_KEY is set; otherwise
+  // the worker still serves subscribers + memory tick.
+  const killSwitchRef = { tripped: false };
+  let agent: ReturnType<typeof createAgentLoop> | null = null;
+  if (config.ANTHROPIC_API_KEY) {
+    try {
+      agent = createAgentLoop({ subscriber, killSwitchRef });
+      agent.emitter.on("assistantText", (text: string) => {
+        log.info(`[agent] ${text.slice(0, 200)}`);
+      });
+      agent.emitter.on("error", (err: unknown) => {
+        log.warn(`[agent] error: ${String(err)}`);
+      });
+      agent.start();
+      log.info("agent loop started");
+    } catch (err) {
+      log.warn(`agent loop start failed (continuing without agent): ${String(err)}`);
+      agent = null;
+    }
+  } else {
+    log.warn(
+      "ANTHROPIC_API_KEY not set — agent loop disabled (subscribers + memory tick still run)"
+    );
+  }
+
   const shutdown = async (signal: string) => {
     log.warn(`received ${signal}, shutting down`);
+    if (agent) agent.stop();
     tick.stop();
     subscriber.stop();
     await server.close();
