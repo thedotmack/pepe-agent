@@ -10,9 +10,28 @@ import { Conversation } from "@elevenlabs/client";
 
 export type AgentStatus = "idle" | "connecting" | "listening" | "speaking";
 
+export type ChatMessage = {
+  role: "user" | "agent";
+  text: string;
+  createdAt: Date;
+  id?: string;
+};
+
+type ElevenLabsMessagePayload = {
+  message: string;
+  event_id?: number;
+  role?: "user" | "agent";
+  source?: "user" | "ai";
+};
+
+type StartOptions = {
+  textOnly?: boolean;
+};
+
 export interface AgentCallbacks {
   onStatusChange: (status: AgentStatus) => void;
   onTranscript: (text: string, isFinal: boolean) => void;
+  onMessage?: (message: ChatMessage) => void;
   /** Called ~60fps while agent is speaking with a 0-1 volume level */
   onVolume: (level: number) => void;
   onError: (error: string) => void;
@@ -29,7 +48,7 @@ export class PepeAgent {
     this.callbacks = callbacks;
   }
 
-  async start(): Promise<void> {
+  async start({ textOnly = false }: StartOptions = {}): Promise<void> {
     this.callbacks.onStatusChange("connecting");
 
     // Fetch a signed URL from our server route (keeps API key server-side)
@@ -48,6 +67,7 @@ export class PepeAgent {
     try {
       this.conversation = await Conversation.startSession({
         signedUrl,
+        textOnly,
 
         onConnect: () => {
           this.callbacks.onStatusChange("listening");
@@ -73,9 +93,21 @@ export class PepeAgent {
           }
         },
 
-        onMessage: (message: { message: string; source: string }) => {
-          if (message.source === "ai") {
-            this.callbacks.onTranscript(message.message, true);
+        onMessage: (message: ElevenLabsMessagePayload) => {
+          const role = this.getMessageRole(message);
+          const chatMessage: ChatMessage = {
+            role,
+            text: message.message,
+            createdAt: new Date(),
+            ...(message.event_id !== undefined
+              ? { id: String(message.event_id) }
+              : {}),
+          };
+
+          this.callbacks.onMessage?.(chatMessage);
+
+          if (role === "agent") {
+            this.callbacks.onTranscript(chatMessage.text, true);
           }
         },
       });
@@ -83,6 +115,17 @@ export class PepeAgent {
       this.callbacks.onError(`Failed to start session: ${err}`);
       this.callbacks.onStatusChange("idle");
     }
+  }
+
+  sendUserMessage(text: string): boolean {
+    if (!this.conversation) return false;
+
+    this.conversation.sendUserMessage(text);
+    return true;
+  }
+
+  sendUserActivity(): void {
+    this.conversation?.sendUserActivity();
   }
 
   async stop(): Promise<void> {
@@ -143,6 +186,11 @@ export class PepeAgent {
       };
       this.volumeRafId = requestAnimationFrame(poll);
     }
+  }
+
+  private getMessageRole(message: ElevenLabsMessagePayload): ChatMessage["role"] {
+    if (message.role) return message.role;
+    return message.source === "ai" ? "agent" : "user";
   }
 
   private stopVolumePolling(): void {

@@ -21,8 +21,12 @@ export function DotMatrixCanvas({
     const ctx = canvas.getContext("2d", { alpha: true });
     if (!ctx) return;
 
-    const W = DOT_BOARD.cols * PIXEL * scale;
-    const H = DOT_BOARD.rows * PIXEL * scale;
+    const rows = matrix.length;
+    const cols = matrix[0]?.length ?? 0;
+    if (cols === 0 || rows === 0) return;
+
+    const W = cols * PIXEL * scale;
+    const H = rows * PIXEL * scale;
     const dpr = window.devicePixelRatio || 1;
     canvas.width = W * dpr;
     canvas.height = H * dpr;
@@ -31,8 +35,8 @@ export function DotMatrixCanvas({
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
 
-    for (let y = 0; y < DOT_BOARD.rows; y++) {
-      for (let x = 0; x < DOT_BOARD.cols; x++) {
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
         const cell = matrix[y][x];
         if (cell.tone === "off" && cell.level === 0) continue;
         const color = COLORS[cell.tone] ?? COLORS.off;

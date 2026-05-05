@@ -20,6 +20,23 @@ export const DOT_BOARD = Object.freeze({
   gap: 1,
 });
 
+export const DOT_BOARD_DESKTOP = Object.freeze({
+  cols: 240,
+  rows: 144,
+  dotSize: 2,
+  gap: 1,
+});
+
+export type BoardDims = { cols: number; rows: number; dotSize: number; gap: number };
+
+function matrixCols(matrix: Matrix): number {
+  return matrix[0]?.length ?? DOT_BOARD.cols;
+}
+
+function matrixRows(matrix: Matrix): number {
+  return matrix.length || DOT_BOARD.rows;
+}
+
 export const COLORS = Object.freeze({
   off: "rgba(8, 18, 30, 0.78)",
   ghost: "rgba(30, 57, 86, 0.42)",
@@ -79,6 +96,8 @@ const GLYPHS_3X5: GlyphTable = {
   "-": ["000", "000", "111", "000", "000"],
   "/": ["001", "001", "010", "100", "100"],
   "#": ["101", "111", "101", "111", "101"],
+  "$": ["111", "110", "011", "101", "111"],
+  "%": ["101", "001", "010", "100", "101"],
   "+": ["000", "010", "111", "010", "000"],
   "!": ["1", "1", "1", "0", "1"],
   "?": ["110", "001", "010", "000", "010"],
@@ -127,6 +146,8 @@ const GLYPHS_5X7: GlyphTable = {
   "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
   "/": ["00001", "00001", "00010", "00100", "01000", "10000", "10000"],
   "#": ["01010", "01010", "11111", "01010", "11111", "01010", "01010"],
+  "$": ["00100", "01111", "10100", "01110", "00101", "11110", "00100"],
+  "%": ["11001", "11010", "00100", "01000", "10110", "00110", "00000"],
   "+": ["00000", "00100", "00100", "11111", "00100", "00100", "00000"],
   "!": ["1", "1", "1", "1", "1", "0", "1"],
   "?": ["1110", "0001", "0001", "0110", "0100", "0000", "0100"],
@@ -166,9 +187,9 @@ const BAYER_4: number[][] = [
   [15, 7, 13, 5],
 ].map((row) => row.map((value) => (value + 0.5) / 16));
 
-export function createMatrix(): Matrix {
-  return Array.from({ length: DOT_BOARD.rows }, () =>
-    Array.from({ length: DOT_BOARD.cols }, () => ({ tone: "off" as Tone, level: 0 })),
+export function createMatrix(cols: number = DOT_BOARD.cols, rows: number = DOT_BOARD.rows): Matrix {
+  return Array.from({ length: rows }, () =>
+    Array.from({ length: cols }, () => ({ tone: "off" as Tone, level: 0 })),
   );
 }
 
@@ -181,8 +202,10 @@ export function setDot(
 ): void {
   const px = Math.round(x);
   const py = Math.round(y);
+  const cols = matrixCols(matrix);
+  const rows = matrixRows(matrix);
 
-  if (px < 0 || py < 0 || px >= DOT_BOARD.cols || py >= DOT_BOARD.rows) return;
+  if (px < 0 || py < 0 || px >= cols || py >= rows) return;
 
   const current = matrix[py][px];
   if (level >= current.level) matrix[py][px] = { tone, level };
@@ -211,8 +234,10 @@ export function drawVerticalLine(
 }
 
 export function drawDottedField(matrix: Matrix, density: number = 11): void {
-  for (let y = 0; y < DOT_BOARD.rows; y += 1) {
-    for (let x = 0; x < DOT_BOARD.cols; x += 1) {
+  const cols = matrixCols(matrix);
+  const rows = matrixRows(matrix);
+  for (let y = 0; y < rows; y += 1) {
+    for (let x = 0; x < cols; x += 1) {
       if ((x * 3 + y * 5) % density === 0) setDot(matrix, x, y, "ghost", 0.13);
     }
   }

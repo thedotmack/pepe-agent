@@ -2,8 +2,11 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Pepe Agent",
-  description: "Talk to Pepe — an interactive AI agent with ElevenLabs voice",
+  title: "Pepe HQ",
+  description: "Watch Pepe scan a live Solana memecoin tape on a dot-matrix board.",
+  icons: {
+    icon: "/favicon.ico",
+  },
 };
 
 export default function RootLayout({

@@ -1,106 +1,49 @@
-# Pepe Agent 🐸
+# Pepe HQ
 
-A standalone Next.js app featuring an interactive Pepe frog head floating on an ASCII effect background, powered by **ElevenLabs Conversational AI**.
+A standalone Next.js app where Pepe is the show: a 108x192 LED dot-matrix board that makes an autonomous Solana memecoin trading loop legible in real time.
 
 ## Stack
 
-- **Next.js 16** (App Router, TypeScript)
+- **Next.js 16** App Router
 - **React 19**
 - **Tailwind CSS v4**
-- **Framer Motion** (`motion/react`) — float / blink / eye-tracking animations
-- **OGL** — WebGL 2 ASCII background renderer
-- **@11labs/client** — ElevenLabs Conversational AI (persistent WebSocket session)
+- **Canvas dot-matrix renderer** for the live board
+- **motion/react** for Pepe blink, float, eye tracking, and lip sync
+- **@11labs/client** for optional voice narration
+- **SSE feed bridge** over the `data.cmem.ai` activity WebSocket with REST fallback
 
-## Features
+## Product Shape
 
-- 🎨 **WebGL ASCII background** — Perlin noise rendered through an ASCII post-process shader; brightness reacts to Pepe's audio output
-- 🐸 **Animated Pepe head** — layered sprites with eye tracking, blinking, float bobbing, and live lip-sync driven by volume
-- 🎤 **Conversational AI** — click the mic button to start a duplex voice session with the ElevenLabs agent; Pepe listens and responds in real-time
-- 💬 **Transcript bubble** — last agent utterance displayed above Pepe's head
+- One screen: no routes, login, wallet connect, menus, or cockpit controls.
+- The matrix owns the UI: header, live status, wallet/P&L, token tape, beam, decision bubble, ticker, and service dots are all drawn into the board.
+- Pepe is layered over the HQ habitat and can still run the optional ElevenLabs voice session by double-clicking the sprite.
+- If the upstream feed is unavailable, the board keeps breathing with a demo tape instead of showing an empty state.
 
-## Getting Started
-
-### 1. Install dependencies
+## Run
 
 ```bash
-cd pepe-agent
 npm install
+npm run dev
 ```
 
-### 2. Configure ElevenLabs
-
-Copy the example env file and fill in your credentials:
-
-```bash
-cp .env.local.example .env.local
-```
-
-Create an **ElevenLabs Conversational Agent** at <https://elevenlabs.io/app/conversational-ai>:
-
-- **Voice**: use `Bj9UqZbhQsanLzgalpEG` (southern guy) or any voice you prefer
-- **System prompt**: give Pepe a personality — paste phrases from MemeDeck's `lib/pepe/phrases.ts`
-- **First message**: `"Sup anon, ready to talk memes?"`
-
-Copy the Agent ID into `ELEVENLABS_AGENT_ID`.
-
-### 3. Run
-
-```bash
-npm run dev   # http://localhost:3010
-```
-
-Click the **mic button** at the bottom of the screen and start talking.
-
-## Architecture
-
-```
-User mic → ElevenLabs Agent WS → Agent response audio
-                                         ↓
-                               Web Audio AnalyserNode
-                               ↙               ↘
-                     Mouth frame selection    ASCII background
-                     (PepeHead lip sync)      uValue uniform
-```
-
-### File structure
-
-```
-pepe-agent/
-├── app/
-│   ├── layout.tsx                  # Root layout
-│   ├── page.tsx                    # Main page — wires everything together
-│   ├── globals.css
-│   └── api/
-│       └── agent-token/
-│           └── route.ts            # Server route — returns signed ElevenLabs URL
-├── components/
-│   ├── ascii-background/
-│   │   └── index.tsx               # WebGL ASCII renderer
-│   ├── pepe-head/
-│   │   └── PepeHead.tsx            # Animated Pepe head with lip sync
-│   └── agent-ui/
-│       └── AgentControls.tsx       # Mic button + status ring
-├── lib/
-│   └── agent.ts                    # ElevenLabs session manager
-├── public/
-│   ├── frames/                     # Mouth/body sprite frames
-│   └── eyes/                       # Pupil layer stack
-├── .env.local.example
-└── README.md
-```
+Local app: <http://localhost:3010>
 
 ## Environment Variables
 
-| Variable | Description |
-|---|---|
-| `ELEVENLABS_API_KEY` | Your ElevenLabs API key (server-side only) |
-| `ELEVENLABS_AGENT_ID` | Agent ID from the ElevenLabs dashboard |
-
-### Live Board feed
-
-The dot-matrix live board pulls real-time activity through `/api/feed` (SSE bridge over a per-request WebSocket; REST polling fallback). Both env vars below have safe defaults that point at `data.cmem.ai`, so the route works without any configuration in preview environments.
-
 | Variable | Description | Default |
 |---|---|---|
-| `ACTIVITY_WS_UPSTREAM_URL` | Upstream WebSocket the feed route subscribes to | `wss://data.cmem.ai/activity` |
-| `ACTIVITY_REST_FALLBACK_URL` | REST endpoint polled at 1.5s when the WS is unavailable | `https://data.cmem.ai/api/activity/top/50` |
+| `ELEVENLABS_API_KEY` | Server-side ElevenLabs API key for optional voice | none |
+| `ELEVENLABS_AGENT_ID` | ElevenLabs conversational agent ID | none |
+| `ACTIVITY_WS_UPSTREAM_URL` | Upstream activity WebSocket | `wss://data.cmem.ai/activity` |
+| `ACTIVITY_REST_FALLBACK_URL` | REST fallback polled when WS is unavailable | `https://data.cmem.ai/api/activity/top/50` |
+
+## Key Files
+
+| File | Purpose |
+|---|---|
+| `app/page.tsx` | Main one-screen board composition |
+| `app/api/feed/route.ts` | SSE bridge for live activity data |
+| `components/dot-board/DotMatrixCanvas.tsx` | Canvas renderer for the 108x192 matrix |
+| `components/dot-board/use-activity-feed.ts` | EventSource client store |
+| `lib/dot-matrix/render-board.ts` | Board layout and animation drawing |
+| `components/pepe-head/PepeHead.tsx` | Pepe sprite, blink, float, eye tracking, and lip sync |
