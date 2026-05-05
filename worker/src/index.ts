@@ -6,6 +6,8 @@ import { createClaudeMemClient } from "./memory/claude-mem-client.ts";
 import { mintContentSessionId } from "./memory/session.ts";
 import { startMemoryTick } from "./memory/tick.ts";
 import { createAgentLoop } from "./agent/loop.ts";
+import { openLedger } from "./trade/ledger.ts";
+import { tryGetPublicKey } from "./trade/wallet.ts";
 
 const log = createLogger("boot");
 
@@ -14,6 +16,23 @@ async function main() {
     network: config.SOLANA_NETWORK,
     port: config.WORKER_PORT,
   });
+
+  // Trade ledger (Phase 4) — opened on boot regardless of wallet config so
+  // `get_open_positions` works even before the first trade. Path is logged
+  // (file location only — never the contents).
+  const ledger = openLedger();
+  log.info(`trade ledger opened at ${ledger.dbPath}`);
+
+  // Wallet status — log pubkey on boot if we have one. Plan Phase 4
+  // anti-pattern explicitly forbids logging the private key.
+  const walletPubkey = tryGetPublicKey();
+  if (walletPubkey) {
+    log.info(`wallet pubkey: ${walletPubkey}`);
+  } else {
+    log.warn(
+      "no wallet configured — submit_trade will be denied (set AGENT_WALLET_PRIVATE_KEY_BASE58)"
+    );
+  }
 
   const server = startWorkerServer();
 
@@ -61,7 +80,13 @@ async function main() {
   let agent: ReturnType<typeof createAgentLoop> | null = null;
   if (config.ANTHROPIC_API_KEY) {
     try {
-      agent = createAgentLoop({ subscriber, killSwitchRef });
+      agent = createAgentLoop({
+        subscriber,
+        killSwitchRef,
+        ledger,
+        memClient,
+        contentSessionId,
+      });
       agent.emitter.on("assistantText", (text: string) => {
         log.info(`[agent] ${text.slice(0, 200)}`);
       });

@@ -6,3 +6,7 @@ node_modules/
 
 # scratch / local dev artifacts
 .scratch/
+
+# trade ledger + agent SDK session state (local + container volumes)
+.data/
+.sessions/

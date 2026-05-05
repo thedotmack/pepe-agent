@@ -27,11 +27,18 @@ import {
 import { config } from "../config.ts";
 import { createLogger } from "../logger.ts";
 import type { ActivitySubscriber } from "../activity/subscriber.ts";
+import type { TradeLedger } from "../trade/ledger.ts";
+import type { ClaudeMemClient } from "../memory/claude-mem-client.ts";
+import { walletAvailable } from "../trade/wallet.ts";
 
 import { SYSTEM_PROMPT } from "./system-prompt.ts";
 import { createPepeMcpServer, type KillSwitchRef } from "./tools/index.ts";
-import { checkTradePolicy, type TradeIntent } from "./trade-policy-stub.ts";
-import { tradePolicyHook } from "./hooks.ts";
+import {
+  checkTradePolicy,
+  type TradeIntent,
+  type PolicyContext,
+} from "../trade/policy.ts";
+import { createTradePolicyHook } from "./hooks.ts";
 
 const log = createLogger("agent.loop");
 
@@ -40,6 +47,9 @@ const PEPE_TRADE_TOOL = "mcp__pepe__submit_trade";
 export interface CreateAgentLoopArgs {
   subscriber: ActivitySubscriber;
   killSwitchRef: KillSwitchRef;
+  ledger: TradeLedger;
+  memClient: ClaudeMemClient;
+  contentSessionId: string;
 }
 
 export interface AgentLoopHandle {
@@ -71,7 +81,7 @@ function extractAssistantText(msg: SDKMessage): string | null {
 }
 
 export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { start: () => void } {
-  const { subscriber, killSwitchRef } = args;
+  const { subscriber, killSwitchRef, ledger, memClient, contentSessionId } = args;
 
   const outbound = new EventEmitter();
   outbound.setMaxListeners(50);
@@ -82,10 +92,20 @@ export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { 
   let stopped = false;
   let runPromise: Promise<void> | null = null;
 
+  const policyContext: PolicyContext = {
+    ledger,
+    walletAvailable: walletAvailable(),
+    now: () => Date.now(),
+    killSwitchTripped: () => killSwitchRef.tripped,
+  };
+
+  const policyCheck = (intent: TradeIntent) =>
+    checkTradePolicy(intent, policyContext);
+
   // ─── canUseTool: secondary gate for submit_trade (defense in depth) ─────
   const canUseTool: CanUseTool = async (toolName, input, _ctx) => {
     if (toolName === PEPE_TRADE_TOOL) {
-      const result = checkTradePolicy(input as unknown as TradeIntent);
+      const result = policyCheck(input as unknown as TradeIntent);
       if (!result.allow) {
         return { behavior: "deny", message: `policy: ${result.reason}` };
       }
@@ -124,15 +144,18 @@ export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { 
       },
       pepe: createPepeMcpServer({
         subscriber,
-        tradePolicyCheck: checkTradePolicy,
+        tradePolicyCheck: policyCheck,
         killSwitchRef,
+        ledger,
+        memClient,
+        contentSessionId,
       }),
     },
     hooks: {
       PreToolUse: [
         {
           matcher: PEPE_TRADE_TOOL,
-          hooks: [tradePolicyHook],
+          hooks: [createTradePolicyHook(policyContext)],
         },
       ],
     },

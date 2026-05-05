@@ -13,33 +13,34 @@ import type {
   HookCallback,
   PreToolUseHookInput,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { TradeIntent } from "./trade-policy-stub.ts";
-import { checkTradePolicy } from "./trade-policy-stub.ts";
+import type { TradeIntent, PolicyContext } from "../trade/policy.ts";
+import { checkTradePolicy } from "../trade/policy.ts";
 import { createLogger } from "../logger.ts";
 
 const log = createLogger("agent.hooks");
 
 /**
- * PreToolUse hook for `mcp__pepe__submit_trade`.
+ * PreToolUse hook factory for `mcp__pepe__submit_trade`.
  *
- * Calls the trade-policy module (NOT inline logic — Phase 4 swaps it for the
- * real one). On deny, returns the SyncHookJSONOutput shape with a
- * PreToolUseHookSpecificOutput carrying permissionDecision='deny'.
+ * Calls the trade-policy module (defense-in-depth: same check runs in
+ * canUseTool and the handler).
  */
-export const tradePolicyHook: HookCallback = async (input, _toolUseId, _ctx) => {
-  const pre = input as PreToolUseHookInput;
-  const intent = pre.tool_input as TradeIntent;
-  const result = checkTradePolicy(intent);
-  if (!result.allow) {
-    log.warn(`trade denied by hook: ${result.reason}`);
-    return {
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: result.reason,
-      },
-    };
-  }
-  // Allow by default — empty SyncHookJSONOutput.
-  return {};
-};
+export function createTradePolicyHook(policyContext: PolicyContext): HookCallback {
+  return async (input, _toolUseId, _ctx) => {
+    const pre = input as PreToolUseHookInput;
+    const intent = pre.tool_input as TradeIntent;
+    const result = checkTradePolicy(intent, policyContext);
+    if (!result.allow) {
+      log.warn(`trade denied by hook: ${result.reason}`);
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: result.reason,
+        },
+      };
+    }
+    // Allow by default — empty SyncHookJSONOutput.
+    return {};
+  };
+}

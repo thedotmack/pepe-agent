@@ -1,12 +1,12 @@
 /**
- * Pepe MCP tool surface (Phase 3).
+ * Pepe MCP tool surface (Phase 4).
  *
- * Six custom tools registered via createSdkMcpServer. Phase 3 ships these as
- * stubs (except `get_top_tokens` and `kill_switch` which are real). Phase 4
- * wires Jupiter / ledger / trade-policy.
+ * Six custom tools registered via createSdkMcpServer. Phase 4 wires the
+ * real Jupiter swap + ledger + trade-policy. submit_trade now actually
+ * executes when policy allows.
  *
- * Subscriber is injected — never imported directly — so tests and replay can
- * pass a fake. Same for the trade-policy check function.
+ * Subscriber, ledger, mem-client, and policy are injected — never imported
+ * directly — so tests and replay can pass fakes.
  */
 import { z } from "zod";
 import {
@@ -15,7 +15,14 @@ import {
   type McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { ActivitySubscriber, ActivityToken } from "../../activity/subscriber.ts";
-import type { TradeIntent, PolicyResult } from "../trade-policy-stub.ts";
+import type { TradeIntent, PolicyResult } from "../../trade/policy.ts";
+import { DEFAULT_SLIPPAGE_BPS, SLIPPAGE_HARD_CAP_BPS, PER_TRADE_MAX_SOL } from "../../trade/policy.ts";
+import type { TradeLedger } from "../../trade/ledger.ts";
+import { executeTrade, getQuote as jupGetQuote } from "../../trade/jupiter.ts";
+import type { ClaudeMemClient } from "../../memory/claude-mem-client.ts";
+import { createLogger } from "../../logger.ts";
+
+const log = createLogger("agent.tools");
 
 export type KillSwitchRef = { tripped: boolean };
 
@@ -23,6 +30,9 @@ export interface CreatePepeMcpServerArgs {
   subscriber: ActivitySubscriber;
   tradePolicyCheck: (intent: TradeIntent) => PolicyResult;
   killSwitchRef: KillSwitchRef;
+  ledger: TradeLedger;
+  memClient: ClaudeMemClient;
+  contentSessionId: string;
 }
 
 const SignalEnum = z.enum(["STRONG", "RISING", "WATCH", "FLAT"]);
@@ -37,7 +47,14 @@ function rankToken(t: ActivityToken): number {
 export function createPepeMcpServer(
   args: CreatePepeMcpServerArgs
 ): McpSdkServerConfigWithInstance {
-  const { subscriber, tradePolicyCheck, killSwitchRef } = args;
+  const {
+    subscriber,
+    tradePolicyCheck,
+    killSwitchRef,
+    ledger,
+    memClient,
+    contentSessionId,
+  } = args;
 
   const getTopTokens = tool(
     "get_top_tokens",
@@ -62,81 +79,185 @@ export function createPepeMcpServer(
 
   const getOpenPositions = tool(
     "get_open_positions",
-    "Read the open positions ledger. Phase 3: stub — always returns empty. Phase 4 wires the real ledger.",
+    "Read the open positions ledger.",
     {},
-    async () => ({
-      content: [{ type: "text", text: "[]" }],
-    })
+    async () => {
+      const positions = ledger.openPositions();
+      return {
+        content: [{ type: "text", text: JSON.stringify(positions) }],
+      };
+    }
   );
 
   const getQuote = tool(
     "get_quote",
-    "Fetch a Jupiter quote (read-only). Phase 3: not implemented.",
+    "Fetch a Jupiter quote (read-only). Use to preview pricing + slippage before submitting a trade. Pass `tokenIn`/`tokenOut` as base58 mint addresses (or 'SOL' for native SOL). `amount` is in atomic units of `tokenIn` — for SOL that's lamports.",
     {
-      tokenIn: z.string().min(32),
-      tokenOut: z.string().min(32),
+      tokenIn: z.string().min(3),
+      tokenOut: z.string().min(3),
       amount: z.string(),
-      slippageBps: z.number().int().min(0).max(300).default(100),
+      slippageBps: z
+        .number()
+        .int()
+        .min(0)
+        .max(SLIPPAGE_HARD_CAP_BPS)
+        .default(DEFAULT_SLIPPAGE_BPS),
     },
-    async () => ({
-      content: [
-        { type: "text", text: "quote-not-yet-implemented (Phase 4)" },
-      ],
-      isError: true,
-    })
+    async (input) => {
+      try {
+        const quote = await jupGetQuote({
+          inputMint: input.tokenIn,
+          outputMint: input.tokenOut,
+          amount: input.amount,
+          slippageBps: input.slippageBps,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(quote) }],
+        };
+      } catch (err) {
+        return {
+          content: [
+            { type: "text", text: `quote-failed: ${String(err)}` },
+          ],
+          isError: true,
+        };
+      }
+    }
   );
 
   const submitTrade = tool(
     "submit_trade",
-    "Sign + submit a swap. Gated by trade-policy + PreToolUse hook + canUseTool. Phase 3: always denied. Provide a one-sentence `reason` Pepe can narrate.",
+    "Sign + submit a swap. Gated by trade-policy + PreToolUse hook + canUseTool. Provide a one-sentence `reason` Pepe can narrate.",
     {
-      tokenIn: z.string().min(32),
-      tokenOut: z.string().min(32),
-      amountSol: z.number().positive().max(2.0),
-      slippageBps: z.number().int().min(0).max(300).default(100),
+      tokenIn: z.string().min(3),
+      tokenOut: z.string().min(3),
+      amountSol: z.number().positive().max(PER_TRADE_MAX_SOL),
+      slippageBps: z
+        .number()
+        .int()
+        .min(0)
+        .max(SLIPPAGE_HARD_CAP_BPS)
+        .default(DEFAULT_SLIPPAGE_BPS),
       reason: z.string().min(8),
     },
     async (input) => {
-      // Defense in depth: even if the hook + canUseTool somehow let this
-      // through, the handler re-checks the policy. Phase 4 also wires the
-      // real Jupiter swap here.
+      // Defense-in-depth: even if hook + canUseTool somehow let this through,
+      // the handler re-checks the policy.
       if (killSwitchRef.tripped) {
         return {
           content: [{ type: "text", text: "denied: kill switch is tripped" }],
           isError: true,
         };
       }
-      const decision = tradePolicyCheck(input as TradeIntent);
+      const intent: TradeIntent = {
+        tokenIn: input.tokenIn,
+        tokenOut: input.tokenOut,
+        amountSol: input.amountSol,
+        slippageBps: input.slippageBps,
+        reason: input.reason,
+      };
+      const decision = tradePolicyCheck(intent);
       if (!decision.allow) {
         return {
           content: [{ type: "text", text: `denied: ${decision.reason}` }],
           isError: true,
         };
       }
-      // Should be unreachable in Phase 3.
+
+      let txid: string;
+      let executedPriceSolPerToken: number | null;
+      try {
+        const result = await executeTrade({
+          inputMint: input.tokenIn,
+          outputMint: input.tokenOut,
+          amountSol: input.amountSol,
+          slippageBps: input.slippageBps,
+        });
+        txid = result.txid;
+        executedPriceSolPerToken = result.executedPriceSolPerToken;
+      } catch (err) {
+        log.error(`submit_trade execute failed: ${String(err)}`);
+        return {
+          content: [
+            { type: "text", text: `execute-failed: ${String(err)}` },
+          ],
+          isError: true,
+        };
+      }
+
+      // Record into ledger. SOL→TOKEN is BUY; we open a position for the
+      // output token. The agent calls `mark_position` to close.
+      ledger.recordTrade({
+        tokenIn: input.tokenIn,
+        tokenOut: input.tokenOut,
+        side: "BUY",
+        amountSol: input.amountSol,
+        txid,
+        executedPriceSolPerToken,
+        reason: input.reason,
+      });
+      ledger.openPosition({
+        tokenId: input.tokenOut,
+        entryPriceSolPerToken: executedPriceSolPerToken ?? 0,
+        sizeSol: input.amountSol,
+      });
+
+      // Record the decision in claude-mem so future sessions see it
+      // (plan Phase 4 step 5, line 388).
+      try {
+        await memClient.recordObservation({
+          contentSessionId,
+          tool_name: "trade-executed",
+          tool_input: JSON.stringify(intent),
+          tool_response: JSON.stringify({ txid, executedPriceSolPerToken }),
+          cwd: process.cwd(),
+          platformSource: "pepe-agent-worker",
+        });
+      } catch (err) {
+        log.warn(`claude-mem record failed (non-fatal): ${String(err)}`);
+      }
+
       return {
-        content: [
-          {
-            type: "text",
-            text: "denied: submit path not implemented (Phase 4)",
-          },
-        ],
-        isError: true,
+        content: [{ type: "text", text: `executed ${txid}` }],
       };
     }
   );
 
   const markPosition = tool(
     "mark_position",
-    "Manually open or close a ledger entry. Phase 3: noop.",
+    "Manually open or close a ledger entry. Use when you've decided to exit a position (action=close) or to record an entry that bypassed submit_trade.",
     {
       tokenId: z.string(),
       action: z.enum(["open", "close"]),
+      symbol: z.string().optional(),
+      entryPriceSolPerToken: z.number().optional(),
+      sizeSol: z.number().optional(),
       reason: z.string(),
     },
-    async () => ({
-      content: [{ type: "text", text: "noop in Phase 3" }],
-    })
+    async ({ tokenId, action, symbol, entryPriceSolPerToken, sizeSol, reason }) => {
+      if (action === "close") {
+        ledger.closePosition(tokenId);
+        return { content: [{ type: "text", text: `closed ${tokenId} (${reason})` }] };
+      }
+      if (entryPriceSolPerToken === undefined || sizeSol === undefined) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "open requires entryPriceSolPerToken + sizeSol",
+            },
+          ],
+          isError: true,
+        };
+      }
+      ledger.openPosition({
+        tokenId,
+        symbol,
+        entryPriceSolPerToken,
+        sizeSol,
+      });
+      return { content: [{ type: "text", text: `opened ${tokenId} (${reason})` }] };
+    }
   );
 
   const killSwitch = tool(
@@ -147,6 +268,7 @@ export function createPepeMcpServer(
     },
     async ({ reason }) => {
       killSwitchRef.tripped = true;
+      log.warn(`kill switch tripped: ${reason}`);
       return {
         content: [
           { type: "text", text: `killed (reason: ${reason})` },

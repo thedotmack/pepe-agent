@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { config } from "../config.ts";
 import { createLogger } from "../logger.ts";
+import { tryGetPublicKey } from "../trade/wallet.ts";
 
 const log = createLogger("rpc");
 
@@ -12,7 +13,7 @@ export interface WorkerServerHandle {
 
 export function startWorkerServer(): WorkerServerHandle {
   const startedAt = Date.now();
-  const walletPubkey = config.AGENT_WALLET_PUBLIC_KEY ?? null;
+  const walletPubkey = tryGetPublicKey();
   const app = new Hono();
 
   // Auth gate: every route requires x-agent-secret. /healthz included intentionally
