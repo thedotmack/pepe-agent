@@ -1,14 +1,18 @@
 /**
- * ElevenLabs Conversational AI session manager.
+ * Pepe-Agent session manager.
  *
- * Wraps @11labs/client's Conversation class and exposes a clean interface
- * for starting/stopping a session plus callbacks for audio volume (used for
- * lip-sync and ASCII background reactivity).
+ * One brain (worker's Claude Agent SDK loop) wrapped in two transports:
+ * text-only (POST /api/agent/chat) and voice (ElevenLabs as mic + speaker).
+ * In voice mode we hijack ElevenLabs's user-role transcript and route it to
+ * the worker; ElevenLabs's own agent-role LLM output is suppressed.
  */
 
 import { Conversation } from "@elevenlabs/client";
+import { streamChat } from "./agent-chat-stream";
 
 export type AgentStatus = "idle" | "connecting" | "listening" | "speaking";
+
+type AgentMode = "text" | "voice" | null;
 
 export type ChatMessage = {
   role: "user" | "agent";
@@ -43,12 +47,24 @@ export class PepeAgent {
   private analyser: AnalyserNode | null = null;
   private volumeRafId: number | null = null;
   private callbacks: AgentCallbacks;
+  private mode: AgentMode = null;
+  private chatAbort: AbortController | null = null;
 
   constructor(callbacks: AgentCallbacks) {
     this.callbacks = callbacks;
   }
 
   async start({ textOnly = false }: StartOptions = {}): Promise<void> {
+    if (textOnly) {
+      this.mode = "text";
+      // Text mode: no socket, no ElevenLabs. We're "listening" the moment
+      // start() resolves — the user can type immediately and sendUserMessage()
+      // will open a streaming POST per turn.
+      this.callbacks.onStatusChange("listening");
+      return;
+    }
+
+    this.mode = "voice";
     this.callbacks.onStatusChange("connecting");
 
     // Fetch a signed URL from our server route (keeps API key server-side)
@@ -93,22 +109,38 @@ export class PepeAgent {
           }
         },
 
+        // Per PLAN-pepe-harness.md:481 — ElevenLabs is mic + speaker, never
+        // the brain. We split incoming messages by role:
+        //   - role === "user": this is the finalized STT transcript. Echo
+        //     it to the chat log AND hijack it to /api/agent/chat so the
+        //     worker's Claude Agent SDK loop is the one that responds.
+        //   - role === "agent": this is the ElevenLabs-bundled LLM trying
+        //     to answer. SUPPRESS — never surface, never log. The worker's
+        //     response (streamed back as SSE chunks) is what reaches the
+        //     dot-matrix log instead.
         onMessage: (message: ElevenLabsMessagePayload) => {
           const role = this.getMessageRole(message);
+          if (role === "agent") {
+            // Discard the ElevenLabs brain's response. The real reply will
+            // arrive via streamChat chunks below.
+            return;
+          }
+
           const chatMessage: ChatMessage = {
-            role,
+            role: "user",
             text: message.message,
             createdAt: new Date(),
             ...(message.event_id !== undefined
               ? { id: String(message.event_id) }
               : {}),
           };
-
           this.callbacks.onMessage?.(chatMessage);
 
-          if (role === "agent") {
-            this.callbacks.onTranscript(chatMessage.text, true);
-          }
+          // Hijack the transcript: forward it to the worker just like the
+          // text-mode path. We intentionally do NOT echo the user message a
+          // second time (sendWorkerTurn would normally echo) since
+          // ElevenLabs already gave us the canonical event_id'd version.
+          this.sendWorkerTurn(message.message, { echoUser: false });
         },
       });
     } catch (err) {
@@ -118,22 +150,109 @@ export class PepeAgent {
   }
 
   sendUserMessage(text: string): boolean {
+    if (this.mode === "text") {
+      this.sendWorkerTurn(text, { echoUser: true });
+      return true;
+    }
     if (!this.conversation) return false;
 
+    // Voice mode: forward to ElevenLabs ONLY. ElevenLabs will echo back a
+    // finalized `onMessage(role: "user")` payload (with its canonical
+    // event_id), and our onMessage handler is the single place that
+    // hijacks the transcript into a worker turn. Calling sendWorkerTurn
+    // directly here would double-fire the worker turn.
     this.conversation.sendUserMessage(text);
     return true;
   }
 
+  /**
+   * One assistant turn driven by the worker's Claude Agent SDK loop.
+   *
+   * POST /api/agent/chat -> SSE chunks -> `onMessage({role: "agent", ...})`.
+   * Used by both text mode and the voice-mode hijack path
+   * (PLAN-pepe-harness.md:481). Concurrent calls are allowed — the worker's
+   * streaming-input generator queues them — but we still abort an in-flight
+   * stream from the SAME mode to avoid interleaving the same assistant
+   * buffer.
+   *
+   * @param text the user's prompt (already a finalized utterance / typed line)
+   * @param echoUser whether to add a `{role: "user"}` chat entry first.
+   *   Text mode: true (no other UI source). Voice hijack: false (the
+   *   ElevenLabs onMessage handler already emitted the user line with its
+   *   canonical event_id).
+   */
+  private sendWorkerTurn(
+    text: string,
+    { echoUser }: { echoUser: boolean },
+  ): void {
+    if (echoUser) {
+      this.callbacks.onMessage?.({
+        role: "user",
+        text,
+        createdAt: new Date(),
+      });
+    }
+
+    // Cancel any in-flight chat stream from a previous turn so we never
+    // interleave two turns into the same assistant message buffer.
+    if (this.chatAbort) {
+      this.chatAbort.abort();
+    }
+    const abort = new AbortController();
+    this.chatAbort = abort;
+
+    this.callbacks.onStatusChange("speaking");
+
+    void streamChat(
+      text,
+      {
+        onChunk: (chunkText) => {
+          // Emit each chunk as its own chat entry so the dot-matrix log
+          // grows incrementally — matches how the agent emits one
+          // `assistantText` per assistant message in a turn.
+          this.callbacks.onMessage?.({
+            role: "agent",
+            text: chunkText,
+            createdAt: new Date(),
+          });
+          this.callbacks.onTranscript(chunkText, true);
+        },
+        onEnd: () => {
+          if (this.chatAbort === abort) this.chatAbort = null;
+          // In voice mode, ElevenLabs's onModeChange owns the
+          // listening/speaking status; only flip it back here for text mode.
+          if (this.mode === "text") {
+            this.callbacks.onStatusChange("listening");
+          }
+        },
+        onError: (err) => {
+          if (this.chatAbort === abort) this.chatAbort = null;
+          this.callbacks.onError(err);
+          if (this.mode === "text") {
+            this.callbacks.onStatusChange("listening");
+          }
+        },
+      },
+      abort.signal,
+    );
+  }
+
   sendUserActivity(): void {
+    if (this.mode === "text") return;
     this.conversation?.sendUserActivity();
   }
 
   async stop(): Promise<void> {
     this.stopVolumePolling();
+    if (this.chatAbort) {
+      this.chatAbort.abort();
+      this.chatAbort = null;
+    }
     if (this.conversation) {
       await this.conversation.endSession();
       this.conversation = null;
     }
+    this.mode = null;
     this.callbacks.onStatusChange("idle");
     this.callbacks.onVolume(0);
   }
@@ -201,6 +320,6 @@ export class PepeAgent {
   }
 
   isActive(): boolean {
-    return this.conversation !== null;
+    return this.mode !== null;
   }
 }

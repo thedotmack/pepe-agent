@@ -46,8 +46,6 @@ async function main() {
     walletPubkey: walletPubkey ?? null,
   });
 
-  const server = startWorkerServer({ stateStore, killSwitchRef });
-
   // claude-mem client. Health-check on boot but never crash if it's down —
   // the worker still serves /healthz and accepts chat without memory.
   const memClient = createClaudeMemClient();
@@ -124,6 +122,11 @@ async function main() {
       "ANTHROPIC_API_KEY not set — agent loop disabled (subscribers + memory tick still run)"
     );
   }
+
+  // Worker HTTP server (must be started AFTER the agent loop is created so
+  // POST /chat can inject into the live query session). When agent is null
+  // the server still serves /state, /healthz, /kill — /chat returns 503.
+  const server = startWorkerServer({ stateStore, killSwitchRef, agent });
 
   const shutdown = async (signal: string) => {
     log.warn(`received ${signal}, shutting down`);
