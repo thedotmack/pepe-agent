@@ -20,6 +20,7 @@
     "zustand": "^5.0.13"
   },
   "devDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.126",
     "@playwright/test": "^1.59.1",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^22",
@@ -29,6 +30,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.2.4",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "zod": "^4"
   }
 }
