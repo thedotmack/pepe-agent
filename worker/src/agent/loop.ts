@@ -109,6 +109,13 @@ export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { 
 
   const options: Options = {
     model: config.ANTHROPIC_MODEL,
+    // The SDK ships native binaries as optional npm deps and falls over on
+    // node:slim arm64 (mis-detects musl). Point at the global `claude` from
+    // `npm i -g @anthropic-ai/claude-code` so we never depend on the bundled
+    // native variant.
+    ...(config.CLAUDE_CODE_PATH
+      ? { pathToClaudeCodeExecutable: config.CLAUDE_CODE_PATH }
+      : {}),
     mcpServers: {
       "mcp-search": {
         type: "stdio",

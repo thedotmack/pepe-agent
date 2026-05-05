@@ -1,0 +1,56 @@
+# Pepe-Agent worker — single-instance long-lived process. The trade ledger
+# (Phase 4) is the source of truth and must not be duplicated, so do NOT
+# scale this service beyond replicas: 1.
+#
+# claude-mem is expected to run on the host (or in its own container).
+# CLAUDE_MEM_WORKER_URL points the worker at it. Default below assumes
+# host-mode claude-mem on the conventional port.
+#
+# Required env (export before `docker compose up` or put in .env):
+#   AGENT_SHARED_SECRET
+#   ANTHROPIC_API_KEY
+# Optional:
+#   AGENT_WALLET_PUBLIC_KEY
+#   AGENT_WALLET_PRIVATE_KEY_BASE58   (Phase 4+)
+#   SOLANA_RPC_URL                    (default devnet public)
+#   SOLANA_NETWORK                    (default devnet)
+
+services:
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    image: pepe-agent-worker:dev
+    container_name: pepe-agent-worker
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:7011:7011"
+    environment:
+      AGENT_SHARED_SECRET: ${AGENT_SHARED_SECRET:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-6}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      AGENT_WALLET_PUBLIC_KEY: ${AGENT_WALLET_PUBLIC_KEY:-}
+      AGENT_WALLET_PRIVATE_KEY_BASE58: ${AGENT_WALLET_PRIVATE_KEY_BASE58:-}
+      AGENT_MAX_BUDGET_USD: ${AGENT_MAX_BUDGET_USD:-5}
+      SOLANA_NETWORK: ${SOLANA_NETWORK:-devnet}
+      SOLANA_RPC_URL: ${SOLANA_RPC_URL:-https://api.devnet.solana.com}
+      MEMEDECK_JUPITER_PROXY_URL: ${MEMEDECK_JUPITER_PROXY_URL:-}
+      CLAUDE_MEM_WORKER_URL: ${CLAUDE_MEM_WORKER_URL:-http://host.docker.internal:37777}
+    volumes:
+      - worker-data:/app/worker/.data
+      - worker-sessions:/app/worker/.sessions
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "curl -fsS -H \"x-agent-secret: $$AGENT_SHARED_SECRET\" http://127.0.0.1:7011/healthz || exit 1"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  worker-data:
+  worker-sessions:
