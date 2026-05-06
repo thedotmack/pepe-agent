@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, FormEvent } from "re
 import PepeHead from "@/components/pepe-head/PepeHead";
 import { PepeAgent, AgentStatus, type ChatMessage } from "@/lib/agent";
 import { DotMatrixCanvas } from "@/components/dot-board/DotMatrixCanvas";
+import { LaunchCouncil } from "@/components/community-launch/LaunchCouncil";
 import { useActivityStream } from "@/lib/activity/use-activity-stream";
 import { useActivityStore } from "@/lib/activity/activity-store";
 import type { ActivityToken } from "@/lib/activity/activity-websocket";
@@ -11,7 +12,8 @@ import type { AgentPhase, FeedStatus } from "@/lib/dot-matrix/render-board";
 import { renderBoard, type ChatLogEntry } from "@/lib/dot-matrix/render-board";
 import { DOT_BOARD, DOT_BOARD_DESKTOP } from "@/lib/dot-matrix/dot-matrix-ui-kit";
 
-const PIXEL = DOT_BOARD.dotSize + DOT_BOARD.gap;
+const PIXEL_MOBILE = DOT_BOARD.dotSize + DOT_BOARD.gap;
+const PIXEL_DESKTOP = DOT_BOARD_DESKTOP.dotSize + DOT_BOARD_DESKTOP.gap;
 const SCREEN_MARGIN = 24;
 
 type SessionKind = "idle" | "text" | "voice";
@@ -117,10 +119,9 @@ export default function HomePage() {
     await agent.start();
   }, [createAgent]);
 
-  const handleSubmit = useCallback(
-    async (event: FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
-      const text = draft.trim();
+  const sendTextToPepe = useCallback(
+    async (rawText: string) => {
+      const text = rawText.trim();
       if (!text) return;
       // Optimistically render the user message in the dot-matrix chat log.
       setChatMessages((current) => [
@@ -137,7 +138,15 @@ export default function HomePage() {
       const sent = agent.sendUserMessage(text);
       if (!sent) setChatError("Pepe HQ chat is not connected.");
     },
-    [draft, ensureAgent],
+    [ensureAgent],
+  );
+
+  const handleSubmit = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      await sendTextToPepe(draft);
+    },
+    [draft, sendTextToPepe],
   );
 
   useEffect(() => {
@@ -234,6 +243,11 @@ export default function HomePage() {
     return boardRows[index]?.tokenId;
   }, [agentState, boardRows, tick]);
 
+  const selectedToken = useMemo(
+    () => boardRows.find((row) => row.tokenId === selectedTokenId),
+    [boardRows, selectedTokenId],
+  );
+
   const agentPhase: AgentPhase = agentState?.phase ?? "IDLE";
   const killSwitch = agentState?.killSwitch ?? false;
 
@@ -248,17 +262,19 @@ export default function HomePage() {
       if (!el) return;
       const { width, height } = el.getBoundingClientRect();
       const isDesktop = window.innerWidth >= 768;
+      const sideReserve = isDesktop ? 456 : 0;
       const dims = isDesktop ? DOT_BOARD_DESKTOP : DOT_BOARD;
-      const boardWidth = dims.cols * PIXEL;
-      const boardHeight = dims.rows * PIXEL;
-      const scale = Math.max(
-        0.4,
-        Math.min(
-          (width - SCREEN_MARGIN * 2) / boardWidth,
-          (height - SCREEN_MARGIN * 2) / boardHeight,
-          isDesktop ? 4 : 3,
-        ),
+      const pixel = isDesktop ? PIXEL_DESKTOP : PIXEL_MOBILE;
+      const boardWidth = dims.cols * pixel;
+      const boardHeight = dims.rows * pixel;
+      // Integer-only fit so each dot lands on a whole pixel — no subpixel
+      // smearing in the CSS transform that blows up text legibility.
+      const rawScale = Math.min(
+        (width - sideReserve - SCREEN_MARGIN * 2) / boardWidth,
+        (height - SCREEN_MARGIN * 2) / boardHeight,
+        isDesktop ? 4 : 3,
       );
+      const scale = Math.max(1, Math.floor(rawScale));
       setLayout(isDesktop ? "desktop" : "mobile");
       setFitScale(scale);
     };
@@ -309,6 +325,7 @@ export default function HomePage() {
   );
 
   const { matrix, pepeFrame, chatInputFrame, cols: boardCols, rows: boardRowsCount } = result;
+  const PIXEL = layout === "desktop" ? PIXEL_DESKTOP : PIXEL_MOBILE;
   const px = (n: number) => n * PIXEL * fitScale;
   const fittedWidth = boardCols * PIXEL * fitScale;
   const fittedHeight = boardRowsCount * PIXEL * fitScale;
@@ -318,7 +335,7 @@ export default function HomePage() {
     <main className="relative h-[100dvh] w-screen overflow-hidden bg-[#03070d] text-white">
       <div
         ref={screenRef}
-        className="grid h-full w-full place-items-center overflow-hidden"
+        className="grid h-full w-full place-items-center overflow-hidden md:pr-[456px]"
         style={{
           background:
             "radial-gradient(circle at 50% 45%, rgba(65,235,224,0.10), transparent 60%)",
@@ -339,7 +356,12 @@ export default function HomePage() {
             }}
           >
             {/* Layer 0 — full dot-matrix board (canvas) */}
-            <DotMatrixCanvas matrix={matrix} scale={1} />
+            <DotMatrixCanvas
+              matrix={matrix}
+              scale={1}
+              dotSize={layout === "desktop" ? DOT_BOARD_DESKTOP.dotSize : DOT_BOARD.dotSize}
+              gap={layout === "desktop" ? DOT_BOARD_DESKTOP.gap : DOT_BOARD.gap}
+            />
 
             {/* Layer 1 — Pepe sprite over the habitat panel */}
             <div
@@ -433,6 +455,17 @@ export default function HomePage() {
       {/* Hidden helpers for screen readers and tests */}
       <div className="sr-only" aria-live="polite">
         Status: {status}. Session: {sessionKind}. Feed: {feedStatus}.
+      </div>
+
+      <div className="absolute inset-x-2 bottom-2 z-20 h-[45dvh] min-h-[320px] md:inset-y-4 md:left-auto md:right-4 md:h-auto md:w-[420px]">
+        <LaunchCouncil
+          agentStatus={status}
+          feedStatus={feedStatus}
+          selectedToken={selectedToken}
+          onAskPepe={(prompt) => {
+            void sendTextToPepe(prompt);
+          }}
+        />
       </div>
 
       {/* Use these so TypeScript isn't grumpy if `px` is not referenced inline */}

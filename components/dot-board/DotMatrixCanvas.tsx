@@ -4,14 +4,16 @@ import { useEffect, useRef } from "react";
 import { DOT_BOARD, COLORS } from "@/lib/dot-matrix/dot-matrix-ui-kit";
 import type { Cell } from "@/lib/dot-matrix/dot-matrix-ui-kit";
 
-const PIXEL = DOT_BOARD.dotSize + DOT_BOARD.gap;
-
 export function DotMatrixCanvas({
   matrix,
   scale = 1,
+  dotSize = DOT_BOARD.dotSize,
+  gap = DOT_BOARD.gap,
 }: {
   matrix: Cell[][];
   scale?: number;
+  dotSize?: number;
+  gap?: number;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
 
@@ -25,8 +27,9 @@ export function DotMatrixCanvas({
     const cols = matrix[0]?.length ?? 0;
     if (cols === 0 || rows === 0) return;
 
-    const W = cols * PIXEL * scale;
-    const H = rows * PIXEL * scale;
+    const pixel = dotSize + gap;
+    const W = cols * pixel * scale;
+    const H = rows * pixel * scale;
     const dpr = window.devicePixelRatio || 1;
     canvas.width = W * dpr;
     canvas.height = H * dpr;
@@ -42,14 +45,14 @@ export function DotMatrixCanvas({
         const color = COLORS[cell.tone] ?? COLORS.off;
         ctx.globalAlpha = Math.max(0.18, cell.level);
         ctx.fillStyle = color;
-        const px = x * PIXEL * scale;
-        const py = y * PIXEL * scale;
-        const size = DOT_BOARD.dotSize * scale;
+        const px = x * pixel * scale;
+        const py = y * pixel * scale;
+        const size = dotSize * scale;
         ctx.fillRect(px, py, size, size);
       }
     }
     ctx.globalAlpha = 1;
-  }, [matrix, scale]);
+  }, [matrix, scale, dotSize, gap]);
 
   return <canvas ref={ref} aria-label="Live trading dot-matrix board" />;
 }

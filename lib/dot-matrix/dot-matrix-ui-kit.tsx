@@ -21,8 +21,8 @@ export const DOT_BOARD = Object.freeze({
 });
 
 export const DOT_BOARD_DESKTOP = Object.freeze({
-  cols: 240,
-  rows: 144,
+  cols: 392,
+  rows: 216,
   dotSize: 2,
   gap: 1,
 });

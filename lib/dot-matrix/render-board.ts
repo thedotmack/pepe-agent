@@ -461,59 +461,62 @@ function renderMobile(rows: ActivityToken[], opts: RenderBoardOptions): RenderBo
 const DESK_COLS = DOT_BOARD_DESKTOP.cols;
 const DESK_ROWS = DOT_BOARD_DESKTOP.rows;
 
-// Pepe HQ habitat: top-left under the wallet line
-const DESK_PEPE_FRAME: PepeFrame = { x: 12, y: 26, w: 64, h: 52 };
-const DESK_PEPE_EYE = { x: 76, y: 44 };
+// Pepe HQ habitat: top-left under the wallet line. Coordinates scaled
+// from the previous 240x144 grid (X * 392/240 ≈ 1.633, Y * 216/144 = 1.5)
+// so the layout fills the new 392x216 board instead of crowding the
+// upper-left quadrant.
+const DESK_PEPE_FRAME: PepeFrame = { x: 20, y: 39, w: 104, h: 78 };
+const DESK_PEPE_EYE = { x: 124, y: 66 };
 
 // Chat input strip across the bottom
-const DESK_CHAT_INPUT_FRAME: PepeFrame = { x: 4, y: 128, w: 232, h: 12 };
+const DESK_CHAT_INPUT_FRAME: PepeFrame = { x: 6, y: 192, w: 380, h: 18 };
 
 // Activity table on right
-const DESK_TABLE_X = 92;
-const DESK_TABLE_Y = 16;
-const DESK_TABLE_W = DESK_COLS - DESK_TABLE_X - 4; // 144
-const DESK_ROW_HEIGHT = 12;
+const DESK_TABLE_X = 150;
+const DESK_TABLE_Y = 24;
+const DESK_TABLE_W = DESK_COLS - DESK_TABLE_X - 4; // 238
+const DESK_ROW_HEIGHT = 18;
 const DESK_TABLE_HEADER_Y = DESK_TABLE_Y;
-const DESK_TABLE_FIRST_ROW = DESK_TABLE_Y + 8;
-const DESK_TABLE_BOTTOM = 124;
+const DESK_TABLE_FIRST_ROW = DESK_TABLE_Y + 12;
+const DESK_TABLE_BOTTOM = 186;
 const DESK_MAX_ROWS = Math.floor((DESK_TABLE_BOTTOM - DESK_TABLE_FIRST_ROW) / DESK_ROW_HEIGHT);
 
-// Column anchors relative to DESK_TABLE_X. Total width budget ≈ 144 cols.
+// Column anchors relative to DESK_TABLE_X. Total width budget ≈ 238 cols.
 const COL_NUM = 0; // "#"
-const COL_SYM = 6; // SYMBOL
-const COL_PRICE = 36; // price
-const COL_GAIN5 = 60; // 5m%
-const COL_BUYP = 80; // buy pressure
-const COL_POOL = 102; // liquidity
-const COL_UPM = 120; // updates/min
-const COL_SIG = 132; // signal label
+const COL_SYM = 10; // SYMBOL
+const COL_PRICE = 60; // price
+const COL_GAIN5 = 100; // 5m%
+const COL_BUYP = 132; // buy pressure
+const COL_POOL = 168; // liquidity
+const COL_UPM = 200; // updates/min
+const COL_SIG = 220; // signal label
 
 function renderDesktop(rows: ActivityToken[], opts: RenderBoardOptions): RenderBoardResult {
   const m = createMatrix(DESK_COLS, DESK_ROWS);
   const phase = opts.beamPhase ?? 0;
   drawDottedField(m, 13);
 
-  // ── Header band (rows 0-12) ───────────────────────────────────────────────
-  drawText(m, "PEPE HQ", 4, 1, { font: "md", tone: "cyan", level: 0.96 });
-  drawText(m, "LIVE ACTIVITY MONITOR", DESK_TABLE_X, 1, {
+  // ── Header band (rows 0-18) ───────────────────────────────────────────────
+  drawText(m, "PEPE HQ", 6, 2, { font: "md", tone: "cyan", level: 0.96 });
+  drawText(m, "LIVE ACTIVITY MONITOR", DESK_TABLE_X, 2, {
     font: "md",
     tone: "cyan",
     level: 0.86,
   });
   // Status badge top-right
-  drawBadge(m, DESK_COLS - 30, 0, statusLabel(opts.status), {
+  drawBadge(m, DESK_COLS - 32, 0, statusLabel(opts.status), {
     tone: statusTone(opts.status),
     active: opts.status === "live",
-    width: 26,
+    width: 28,
   });
   // Phase 5: AGENT phase badge to the left of the FEED badge.
   const agentPhaseD = opts.agentPhase ?? "IDLE";
   const killD = opts.killSwitch ?? false;
-  drawBadge(m, DESK_COLS - 60, 0, agentLabel(agentPhaseD, killD), {
+  drawBadge(m, DESK_COLS - 64, 0, agentLabel(agentPhaseD, killD), {
     tone: agentTone(agentPhaseD, killD),
     active:
       agentPhaseD === "CALLING" || agentPhaseD === "TRADING" || killD,
-    width: 26,
+    width: 28,
   });
 
   // ── Activity table ────────────────────────────────────────────────────────
@@ -539,12 +542,12 @@ function renderDesktop(rows: ActivityToken[], opts: RenderBoardOptions): RenderB
   drawText(m, "POOL", tx + COL_POOL, hy, headerOpts);
   drawText(m, "U/M", tx + COL_UPM, hy, headerOpts);
   drawText(m, "SIG", tx + COL_SIG, hy, headerOpts);
-  drawLine(m, tx, hy + 6, DESK_TABLE_W - 4, "ghost", 0.32);
+  drawLine(m, tx, hy + 9, DESK_TABLE_W - 4, "ghost", 0.32);
 
   // Token rows
   const visible = rows.slice(0, DESK_MAX_ROWS);
   if (visible.length === 0) {
-    drawText(m, "SCANNING THE TAPE", tx + 20, DESK_TABLE_FIRST_ROW + 30, {
+    drawText(m, "SCANNING THE TAPE", tx + 32, DESK_TABLE_FIRST_ROW + 45, {
       font: "md",
       tone: "dim",
       level: 0.66,
@@ -564,8 +567,8 @@ function renderDesktop(rows: ActivityToken[], opts: RenderBoardOptions): RenderB
         const lvlTop = tradingFlash > 0 ? 0.3 + 0.4 * tradingFlash : 0.18;
         const lvlBot = tradingFlash > 0 ? 0.2 + 0.3 * tradingFlash : 0.12;
         for (let bx = tx - 1; bx < tx + DESK_TABLE_W - 2; bx += 1) {
-          setDot(m, bx, y - 1, tone, lvlTop);
-          setDot(m, bx, y + DESK_ROW_HEIGHT - 3, tone, lvlBot);
+          setDot(m, bx, y - 2, tone, lvlTop);
+          setDot(m, bx, y + DESK_ROW_HEIGHT - 4, tone, lvlBot);
         }
       }
 
@@ -582,37 +585,37 @@ function renderDesktop(rows: ActivityToken[], opts: RenderBoardOptions): RenderB
         font: "sm",
         tone: active ? "cyan" : "white",
         level: active ? 1 : 0.92,
-        maxWidth: 28,
+        maxWidth: 46,
       });
       drawText(m, `$${formatPrice(t.price ?? 0)}`, tx + COL_PRICE, y, {
         font: "sm",
         tone: "white",
         level: 0.78,
-        maxWidth: 22,
+        maxWidth: 36,
       });
       drawText(m, formatGain(gain), tx + COL_GAIN5, y, {
         font: "sm",
         tone: rowToneForGain(gain),
         level: 0.9,
-        maxWidth: 18,
+        maxWidth: 30,
       });
       drawText(m, formatBuyP(t.buyPressure5m), tx + COL_BUYP, y, {
         font: "sm",
         tone: (t.buyPressure5m ?? 0) > 0.5 ? "cyan" : "dim",
         level: 0.86,
-        maxWidth: 20,
+        maxWidth: 32,
       });
       drawText(m, formatLiq(t.liquidity), tx + COL_POOL, y, {
         font: "sm",
         tone: "white",
         level: 0.78,
-        maxWidth: 16,
+        maxWidth: 28,
       });
       drawText(m, String(Math.round(t.updatesPerMinute ?? 0)), tx + COL_UPM, y, {
         font: "sm",
         tone: "cyan",
         level: 0.78,
-        maxWidth: 10,
+        maxWidth: 16,
       });
       drawText(m, sig, tx + COL_SIG, y, {
         font: "sm",
@@ -623,31 +626,31 @@ function renderDesktop(rows: ActivityToken[], opts: RenderBoardOptions): RenderB
     });
   }
 
-  // ── Pepe HQ panel (cols 0-88, rows 14-122) ────────────────────────────────
-  drawPanel(m, 2, 14, 86, 108, { tone: "blue", level: 0.4 });
+  // ── Pepe HQ panel ─────────────────────────────────────────────────────────
+  drawPanel(m, 4, 22, 140, 162, { tone: "blue", level: 0.4 });
 
   // Wallet + PnL header inside the panel
-  drawText(m, `${formatSol(opts.walletSol ?? 4.21)} SOL`, 6, 16, {
+  drawText(m, `${formatSol(opts.walletSol ?? 4.21)} SOL`, 10, 26, {
     font: "sm",
     tone: "white",
     level: 0.86,
   });
-  drawText(m, formatUsd(opts.pnlUsd ?? 24.18), 50, 16, {
+  drawText(m, formatUsd(opts.pnlUsd ?? 24.18), 82, 26, {
     font: "sm",
     tone: (opts.pnlUsd ?? 24.18) >= 0 ? "cyan" : "amber",
     level: 0.86,
   });
-  drawLine(m, 5, 22, 80, "ghost", 0.32);
+  drawLine(m, 8, 35, 132, "ghost", 0.32);
 
   // Decision bubble below Pepe (Pepe sprite overlay sits at DESK_PEPE_FRAME)
   const activeToken = visible.find((t) => t.tokenId === opts.selectedTokenId);
   const bubbleLevel = opts.status === "stale" ? 0.76 : 0.58 + 0.22 * Math.sin(phase * Math.PI);
-  drawPanel(m, 4, 80, 82, 22, {
+  drawPanel(m, 8, 122, 132, 32, {
     tone: opts.status === "stale" ? "amber" : "cyan",
     level: bubbleLevel,
     active: phase > 0.6,
   });
-  drawWrappedText(m, decisionMessage(activeToken, opts), 7, 84, 76, {
+  drawWrappedText(m, decisionMessage(activeToken, opts), 12, 127, 124, {
     font: "sm",
     tone: "white",
     level: 0.9,
@@ -657,27 +660,27 @@ function renderDesktop(rows: ActivityToken[], opts: RenderBoardOptions): RenderB
   // Chat log (last 2 messages)
   const recent = (opts.chat ?? []).slice(-2);
   if (recent.length === 0) {
-    drawText(m, "TYPE BELOW TO TALK TO PEPE", 6, 108, {
+    drawText(m, "TYPE BELOW TO TALK TO PEPE", 10, 162, {
       font: "sm",
       tone: "dim",
       level: 0.5,
-      maxWidth: 80,
+      maxWidth: 130,
     });
   } else {
     recent.forEach((msg, i) => {
-      const y = 108 + i * 7;
+      const y = 162 + i * 11;
       const tone: Tone = msg.role === "user" ? "amber" : "cyan";
       const prefix = msg.role === "user" ? "YOU" : msg.role === "assistant" ? "PEP" : "SYS";
-      drawText(m, `${prefix} ${msg.text}`, 6, y, {
+      drawText(m, `${prefix} ${msg.text}`, 10, y, {
         font: "sm",
         tone,
         level: 0.78,
-        maxWidth: 80,
+        maxWidth: 130,
       });
     });
   }
 
-  // ── Chat input strip across bottom (rows 128-140) ────────────────────────
+  // ── Chat input strip across bottom (rows 192-210) ────────────────────────
   drawPanel(
     m,
     DESK_CHAT_INPUT_FRAME.x,
@@ -686,29 +689,29 @@ function renderDesktop(rows: ActivityToken[], opts: RenderBoardOptions): RenderB
     DESK_CHAT_INPUT_FRAME.h,
     { tone: "blue", level: 0.5, active: opts.cursorOn ?? false },
   );
-  drawText(m, "PEPE>", DESK_CHAT_INPUT_FRAME.x + 4, DESK_CHAT_INPUT_FRAME.y + 3, {
+  drawText(m, "PEPE>", DESK_CHAT_INPUT_FRAME.x + 6, DESK_CHAT_INPUT_FRAME.y + 6, {
     font: "sm",
     tone: "cyan",
     level: 0.95,
   });
-  drawText(m, "ASK PEPE OR TYPE A COMMAND", DESK_CHAT_INPUT_FRAME.x + 28, DESK_CHAT_INPUT_FRAME.y + 3, {
+  drawText(m, "ASK PEPE OR TYPE A COMMAND", DESK_CHAT_INPUT_FRAME.x + 44, DESK_CHAT_INPUT_FRAME.y + 6, {
     font: "sm",
     tone: "dim",
     level: opts.draft && opts.draft.length > 0 ? 0.0 : 0.55,
-    maxWidth: 150,
+    maxWidth: 240,
   });
   // Send hint badge on the right of the input strip
-  drawBadge(m, DESK_CHAT_INPUT_FRAME.x + DESK_CHAT_INPUT_FRAME.w - 22, DESK_CHAT_INPUT_FRAME.y + 1, "SEND", {
+  drawBadge(m, DESK_CHAT_INPUT_FRAME.x + DESK_CHAT_INPUT_FRAME.w - 36, DESK_CHAT_INPUT_FRAME.y + 2, "SEND", {
     tone: "cyan",
     active: (opts.draft?.trim().length ?? 0) > 0,
-    width: 20,
+    width: 32,
   });
 
   // ── Selection beam from Pepe eye to active row ───────────────────────────
   if (opts.selectedTokenId) {
     const idx = visible.findIndex((t) => t.tokenId === opts.selectedTokenId);
     if (idx >= 0) {
-      const rowY = DESK_TABLE_FIRST_ROW + idx * DESK_ROW_HEIGHT + 3;
+      const rowY = DESK_TABLE_FIRST_ROW + idx * DESK_ROW_HEIGHT + 5;
       drawBeam(
         m,
         DESK_PEPE_EYE,
