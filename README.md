@@ -28,6 +28,17 @@ npm run dev
 
 Local app: <http://localhost:3010>
 
+## Director Mode
+
+Pepe Director is a screencast and live-call stage where you can type lines and make Pepe speak them with browser speech or a contributor-owned ElevenLabs key.
+
+```bash
+npm run dev
+open http://localhost:3010/director
+```
+
+For OBS Virtual Camera setup, ElevenLabs BYO-key usage, and contributor notes, see [docs/director-mode/README.md](docs/director-mode/README.md).
+
 ## Environment Variables
 
 | Variable | Description | Default |
