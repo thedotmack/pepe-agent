@@ -1,0 +1,7 @@
+node_modules/
+.data/
+.sessions/
+.scratch/
+.env
+.env.*
+*.log

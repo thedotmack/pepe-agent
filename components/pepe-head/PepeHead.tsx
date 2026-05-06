@@ -41,6 +41,8 @@ interface PepeHeadProps {
   transcript?: string | null;
   /** Whether Pepe is currently speaking (drives scale pulse) */
   isSpeaking?: boolean;
+  /** Rendered sprite box size in CSS pixels. */
+  size?: number;
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -49,6 +51,7 @@ export default function PepeHead({
   volume = 0,
   transcript = null,
   isSpeaking = false,
+  size = 240,
 }: PepeHeadProps) {
   const [currentFrame, setCurrentFrame] = useState<string>(SPRITE_CONFIG.sequence[0]);
   const [isBlinking, setIsBlinking] = useState(false);
@@ -200,10 +203,12 @@ export default function PepeHead({
     <div
       ref={pepeDivRef}
       className="relative w-60 h-60 cursor-pointer select-none"
+      style={{ width: size, height: size }}
       title="Double-click me!"
     >
       <motion.div
         className="relative w-full h-full"
+        style={{ width: "100%", height: "100%" }}
         animate={{
           scale: isSpeaking ? 1.05 : 1,
           rotate: headRotation,
@@ -291,7 +296,8 @@ export default function PepeHead({
         {/* Speaking indicator dot */}
         {isSpeaking && (
           <motion.div
-            className="absolute -top-2 -right-2 w-4 h-4 bg-green-400 rounded-full"
+            className="absolute -top-2 -right-2 w-4 h-4 rounded-full"
+            style={{ backgroundColor: "rgb(65 235 224)" }}
             animate={{ scale: [1, 1.3, 1] }}
             transition={{ duration: 0.6, repeat: Infinity }}
           />
