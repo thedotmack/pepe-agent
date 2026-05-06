@@ -4,7 +4,8 @@ import { useEffect } from "react";
 import { initializeActivityWebSocket } from "./activity-websocket";
 import { useActivityStore } from "./activity-store";
 
-let initialized = false;
+let mountCount = 0;
+let sharedCleanup: (() => void) | null = null;
 
 /**
  * Initializes the singleton activity websocket exactly once and pipes
@@ -17,16 +18,21 @@ export function useActivityStream(): void {
   const setError = useActivityStore((s) => s.setError);
 
   useEffect(() => {
-    if (initialized) return;
-    initialized = true;
-    const { cleanup } = initializeActivityWebSocket({
-      onTokenUpdate: setTokens,
-      onConnectionChange: setConnectionState,
-      onError: setError,
-    });
+    mountCount += 1;
+    if (mountCount === 1) {
+      const { cleanup } = initializeActivityWebSocket({
+        onTokenUpdate: setTokens,
+        onConnectionChange: setConnectionState,
+        onError: setError,
+      });
+      sharedCleanup = cleanup;
+    }
     return () => {
-      initialized = false;
-      cleanup();
+      mountCount = Math.max(0, mountCount - 1);
+      if (mountCount === 0) {
+        sharedCleanup?.();
+        sharedCleanup = null;
+      }
     };
   }, [setTokens, setConnectionState, setError]);
 }

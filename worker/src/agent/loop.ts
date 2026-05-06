@@ -107,6 +107,14 @@ export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { 
   const policyCheck = (intent: TradeIntent) =>
     checkTradePolicy(intent, policyContext);
 
+  const emitError = (err: unknown): void => {
+    if (outbound.listenerCount("error") > 0) {
+      outbound.emit("error", err);
+      return;
+    }
+    log.error(`unhandled agent error: ${String(err)}`);
+  };
+
   // ─── canUseTool: secondary gate for submit_trade (defense in depth) ─────
   const canUseTool: CanUseTool = async (toolName, input, _ctx) => {
     if (toolName === PEPE_TRADE_TOOL) {
@@ -227,7 +235,7 @@ export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { 
           }
         } catch (err) {
           if (!stopped) log.error(`agent loop crashed: ${String(err)}`);
-          outbound.emit("error", err);
+          emitError(err);
         } finally {
           log.info("agent loop exited");
         }
@@ -235,7 +243,7 @@ export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { 
     } catch (err) {
       // Some SDK paths may throw synchronously on bad config (e.g. missing API key).
       log.error(`agent loop failed to start: ${String(err)}`);
-      outbound.emit("error", err);
+      emitError(err);
     }
   }
 

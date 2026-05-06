@@ -164,7 +164,7 @@ function formatLiq(value: number | undefined): string {
   return `${Math.round(value)}`;
 }
 
-function formatTime(value: number | string | undefined, isAge = false): string {
+function formatTime(value: number | string | undefined): string {
   if (!value) return "--";
   const ts = typeof value === "string" ? new Date(value).getTime() : value;
   if (!Number.isFinite(ts)) return "--";
@@ -172,7 +172,7 @@ function formatTime(value: number | string | undefined, isAge = false): string {
   if (total >= 86400) return `${Math.floor(total / 86400)}D`;
   if (total >= 3600) return `${Math.floor(total / 3600)}H`;
   if (total >= 60) return `${Math.floor(total / 60)}M`;
-  return isAge ? `${total}S` : `${total}S`;
+  return `${total}S`;
 }
 
 function formatSol(value: number): string {

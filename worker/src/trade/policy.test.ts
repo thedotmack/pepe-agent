@@ -29,6 +29,7 @@ function fakeLedger(state: FakeLedgerState): TradeLedger {
   return {
     dbPath: ":memory:",
     recordTrade: () => ({ id: 1 }),
+    hasTradeTxid: () => false,
     lastTradeMs: () => state.lastTradeMs,
     totalSolToday: () => state.totalSolToday,
     openPositions: () =>

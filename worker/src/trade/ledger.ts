@@ -31,6 +31,7 @@ export interface TradeLedger {
     executedPriceSolPerToken: number | null;
     reason: string;
   }): { id: number };
+  hasTradeTxid(txid: string): boolean;
   lastTradeMs(): number | null;
   totalSolToday(): number;
   openPositions(): Array<{
@@ -97,6 +98,7 @@ CREATE TABLE IF NOT EXISTS positions (
   closedAt INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_txid_unique ON trades(txid) WHERE txid IS NOT NULL;
 `;
 
 export function openLedger(): TradeLedger {
@@ -112,6 +114,9 @@ export function openLedger(): TradeLedger {
   );
   const lastTradeStmt = db.prepare(
     `SELECT MAX(ts) AS lastTs FROM trades`
+  );
+  const tradeByTxidStmt = db.prepare(
+    `SELECT 1 AS found FROM trades WHERE txid = $txid LIMIT 1`
   );
   const totalTodayStmt = db.prepare(
     `SELECT COALESCE(SUM(amountSol), 0) AS total
@@ -152,6 +157,10 @@ export function openLedger(): TradeLedger {
         $reason: input.reason,
       });
       return { id: Number(result.lastInsertRowid) };
+    },
+    hasTradeTxid(txid) {
+      const row = tradeByTxidStmt.get({ $txid: txid }) as { found: number } | undefined;
+      return row?.found === 1;
     },
     lastTradeMs() {
       const row = lastTradeStmt.get() as { lastTs: number | null } | undefined;

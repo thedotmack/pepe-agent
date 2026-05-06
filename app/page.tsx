@@ -384,7 +384,7 @@ export default function HomePage() {
               role="button"
               tabIndex={0}
               aria-label={
-                agentRef.current?.isActive() ? "Stop Pepe voice" : "Start Pepe voice"
+                sessionKind !== "idle" ? "Stop Pepe voice" : "Start Pepe voice"
               }
               title="Double-click for voice"
             >

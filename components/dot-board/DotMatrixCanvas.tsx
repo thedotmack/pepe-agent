@@ -39,8 +39,11 @@ export function DotMatrixCanvas({
     ctx.clearRect(0, 0, W, H);
 
     for (let y = 0; y < rows; y++) {
+      const row = matrix[y];
+      if (!row) continue;
       for (let x = 0; x < cols; x++) {
-        const cell = matrix[y][x];
+        const cell = row[x];
+        if (!cell) continue;
         if (cell.tone === "off" && cell.level === 0) continue;
         const color = COLORS[cell.tone] ?? COLORS.off;
         ctx.globalAlpha = Math.max(0.18, cell.level);

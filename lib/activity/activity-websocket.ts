@@ -96,6 +96,7 @@ function normalizeTokens(raw: unknown[]): ActivityToken[] {
 }
 
 let globalActivityWebSocket: WebSocket | null = null;
+let inFlightActivityWebSocket: WebSocket | null = null;
 let isConnecting = false;
 let connectionCallbacks: Array<(ws: WebSocket) => void> = [];
 let messageHandlers: Array<(message: ActivityMessage) => void> = [];
@@ -104,7 +105,7 @@ let reconnectAttempts = 0;
 let reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
 let lastUpdateTime = 0;
-let pendingUpdate: ActivityToken[] | null = null;
+let pendingMessage: ActivityMessage | null = null;
 let updateTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
 const MAX_RECONNECT_ATTEMPTS = 10;
@@ -134,16 +135,17 @@ function scheduleReconnect() {
   }, RECONNECT_DELAY);
 }
 
-function throttledTokenUpdate(
-  tokens: ActivityToken[],
-  onUpdate: (tokens: ActivityToken[]) => void,
-) {
+function flushMessage(message: ActivityMessage) {
+  messageHandlers.forEach((handler) => handler(message));
+}
+
+function throttledMessageDispatch(message: ActivityMessage) {
   const now = Date.now();
-  pendingUpdate = tokens;
+  pendingMessage = message;
   if (now - lastUpdateTime >= THROTTLE_DELAY) {
     lastUpdateTime = now;
-    onUpdate(tokens);
-    pendingUpdate = null;
+    flushMessage(message);
+    pendingMessage = null;
     if (updateTimeoutId) {
       clearTimeout(updateTimeoutId);
       updateTimeoutId = null;
@@ -153,10 +155,10 @@ function throttledTokenUpdate(
   if (!updateTimeoutId) {
     const remaining = THROTTLE_DELAY - (now - lastUpdateTime);
     updateTimeoutId = setTimeout(() => {
-      if (pendingUpdate) {
+      if (pendingMessage) {
         lastUpdateTime = Date.now();
-        onUpdate(pendingUpdate);
-        pendingUpdate = null;
+        flushMessage(pendingMessage);
+        pendingMessage = null;
       }
       updateTimeoutId = null;
     }, remaining);
@@ -220,8 +222,16 @@ function getOrCreateActivityWebSocket(): Promise<WebSocket> {
 
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(ACTIVITY_WEBSOCKET_URL);
+    inFlightActivityWebSocket = ws;
 
     ws.onopen = () => {
+      inFlightActivityWebSocket = null;
+      if (messageHandlers.length === 0) {
+        isConnecting = false;
+        ws.close(1000);
+        resolve(ws);
+        return;
+      }
       globalActivityWebSocket = ws;
       isConnecting = false;
       reconnectAttempts = 0;
@@ -245,7 +255,7 @@ function getOrCreateActivityWebSocket(): Promise<WebSocket> {
           data: tokens,
           timestamp: parsed.timestamp,
         };
-        messageHandlers.forEach((handler) => handler(message));
+        throttledMessageDispatch(message);
       } catch (error) {
         console.warn("[activity] parse error", error);
       }
@@ -253,12 +263,14 @@ function getOrCreateActivityWebSocket(): Promise<WebSocket> {
 
     ws.onclose = (event) => {
       globalActivityWebSocket = null;
+      if (inFlightActivityWebSocket === ws) inFlightActivityWebSocket = null;
       isConnecting = false;
       notifyConnectionState("disconnected");
       if (event.code !== 1000) scheduleReconnect();
     };
 
     ws.onerror = (err) => {
+      if (inFlightActivityWebSocket === ws) inFlightActivityWebSocket = null;
       isConnecting = false;
       notifyConnectionState("error");
       reject(err);
@@ -297,7 +309,7 @@ export function initializeActivityWebSocket({
   if (cached.length > 0) onTokenUpdate(cached);
 
   const unregisterMessage = registerActivityMessageHandler((message) => {
-    throttledTokenUpdate(message.data, onTokenUpdate);
+    onTokenUpdate(message.data);
   });
 
   const unregisterState = registerConnectionStateHandler((state) => {
@@ -322,15 +334,21 @@ export function initializeActivityWebSocket({
     cleanup: () => {
       unregisterMessage();
       unregisterState();
-      clearReconnectTimeout();
-      if (updateTimeoutId) {
-        clearTimeout(updateTimeoutId);
-        updateTimeoutId = null;
-      }
-      pendingUpdate = null;
-      if (messageHandlers.length === 0 && globalActivityWebSocket) {
-        globalActivityWebSocket.close(1000);
-        globalActivityWebSocket = null;
+      if (messageHandlers.length === 0) {
+        clearReconnectTimeout();
+        if (updateTimeoutId) {
+          clearTimeout(updateTimeoutId);
+          updateTimeoutId = null;
+        }
+        pendingMessage = null;
+        if (inFlightActivityWebSocket) {
+          inFlightActivityWebSocket.close(1000);
+          inFlightActivityWebSocket = null;
+        }
+        if (globalActivityWebSocket) {
+          globalActivityWebSocket.close(1000);
+          globalActivityWebSocket = null;
+        }
       }
     },
   };

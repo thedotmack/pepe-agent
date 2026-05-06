@@ -212,32 +212,57 @@ export function createPepeMcpServer(
         };
       }
 
-      // Record into ledger. SOL→TOKEN is BUY; we open a position for the
-      // output token. The agent calls `mark_position` to close.
-      ledger.recordTrade({
-        tokenIn: input.tokenIn,
-        tokenOut: input.tokenOut,
-        side: "BUY",
-        amountSol: input.amountSol,
-        txid,
-        executedPriceSolPerToken,
-        reason: input.reason,
-      });
-      ledger.openPosition({
-        tokenId: input.tokenOut,
-        entryPriceSolPerToken: executedPriceSolPerToken ?? 0,
-        sizeSol: input.amountSol,
-      });
+      try {
+        // Record into ledger. SOL->TOKEN is BUY; we open a position for the
+        // output token. The agent calls `mark_position` to close.
+        if (!ledger.hasTradeTxid(txid)) {
+          ledger.recordTrade({
+            tokenIn: input.tokenIn,
+            tokenOut: input.tokenOut,
+            side: "BUY",
+            amountSol: input.amountSol,
+            txid,
+            executedPriceSolPerToken,
+            reason: input.reason,
+          });
+        }
+        ledger.openPosition({
+          tokenId: input.tokenOut,
+          entryPriceSolPerToken: executedPriceSolPerToken ?? 0,
+          sizeSol: input.amountSol,
+        });
 
-      // Phase 5: record the decision in the state store for the dot-matrix
-      // log; symbol extraction is a stub — agent's reason text matters more.
-      stateStore.recordDecision({
-        ts: Date.now(),
-        symbol: input.tokenOut.slice(0, 8),
-        action: "BUY",
-        reason: input.reason,
-      });
-      stateStore.setSelectedToken(input.tokenOut);
+        // Phase 5: record the decision in the state store for the dot-matrix
+        // log; symbol extraction is a stub - agent's reason text matters more.
+        stateStore.recordDecision({
+          ts: Date.now(),
+          symbol: input.tokenOut.slice(0, 8),
+          action: "BUY",
+          reason: input.reason,
+        });
+        stateStore.setSelectedToken(input.tokenOut);
+      } catch (err) {
+        log.error(`post-trade bookkeeping failed after txid ${txid}: ${String(err)}`);
+        try {
+          stateStore.recordDecision({
+            ts: Date.now(),
+            symbol: input.tokenOut.slice(0, 8),
+            action: "BUY",
+            reason: `executed ${txid}; bookkeeping failed, do not retry automatically`,
+          });
+          stateStore.setSelectedToken(input.tokenOut);
+        } catch (stateErr) {
+          log.error(`state recovery failed for executed txid ${txid}: ${String(stateErr)}`);
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `executed ${txid}; local bookkeeping failed and needs reconciliation before another trade`,
+            },
+          ],
+        };
+      }
 
       // Record the decision in claude-mem so future sessions see it
       // (plan Phase 4 step 5, line 388).
