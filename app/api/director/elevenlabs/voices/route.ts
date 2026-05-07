@@ -13,7 +13,7 @@ export async function POST(req: Request) {
     return Response.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const apiKey = body.apiKey?.trim();
+  const apiKey = process.env.ELEVENLABS_API_KEY?.trim() || body.apiKey?.trim();
   if (!apiKey) {
     return Response.json({ error: "ElevenLabs API key required" }, { status: 400 });
   }

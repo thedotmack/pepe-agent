@@ -73,13 +73,16 @@ export default function PepeHead({
       setCurrentFrame(SPRITE_CONFIG.sequence[0]);
       return;
     }
-    // Map volume 0-1 → mouth frame
-    if (volume > 0.55) {
-      setCurrentFrame(SPRITE_CONFIG.sequence[1]); // wide open
-    } else if (volume > 0.25) {
-      setCurrentFrame(SPRITE_CONFIG.sequence[3]); // mid
+    if (volume > 0.74) {
+      setCurrentFrame(SPRITE_CONFIG.sequence[1]);
+    } else if (volume > 0.52) {
+      setCurrentFrame(SPRITE_CONFIG.sequence[4]);
+    } else if (volume > 0.3) {
+      setCurrentFrame(SPRITE_CONFIG.sequence[3]);
+    } else if (volume > 0.1) {
+      setCurrentFrame(SPRITE_CONFIG.sequence[2]);
     } else {
-      setCurrentFrame(SPRITE_CONFIG.sequence[0]); // closed
+      setCurrentFrame(SPRITE_CONFIG.sequence[0]);
     }
   }, [volume, isSpeaking]);
 

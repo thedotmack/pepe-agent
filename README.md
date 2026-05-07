@@ -45,6 +45,11 @@ For OBS Virtual Camera setup, ElevenLabs BYO-key usage, and contributor notes, s
 |---|---|---|
 | `ELEVENLABS_API_KEY` | Server-side ElevenLabs API key for optional voice | none |
 | `ELEVENLABS_AGENT_ID` | ElevenLabs conversational agent ID | none |
+| `ELEVENLABS_DIRECTOR_VOICE_ID` | Server-side Director voice override | none |
+| `ELEVENLABS_DIRECTOR_MODEL_ID` | Server-side Director model override | `eleven_flash_v2_5` |
+| `NEXT_PUBLIC_ELEVENLABS_DIRECTOR_ENABLED` | Start Director in ElevenLabs mode when set to `1` | none |
+| `NEXT_PUBLIC_ELEVENLABS_DIRECTOR_VOICE_ID` | Browser-visible Director voice id for cache keys and defaults | none |
+| `NEXT_PUBLIC_ELEVENLABS_DIRECTOR_MODEL_ID` | Browser-visible Director model id for cache keys and defaults | `eleven_flash_v2_5` |
 | `ACTIVITY_WS_UPSTREAM_URL` | Upstream activity WebSocket | `wss://data.cmem.ai/activity` |
 | `ACTIVITY_REST_FALLBACK_URL` | REST fallback polled when WS is unavailable | `https://data.cmem.ai/api/activity/top/50` |
 

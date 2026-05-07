@@ -26,6 +26,12 @@ const PEPE_ASSETS = [
 const ELEVENLABS_DEFAULT_MODEL = "eleven_flash_v2_5";
 const INTRO_LINE = "gm, welcome back to Pepe HQ.";
 const DIRECTOR_AUDIO_CACHE = "pepe-director-elevenlabs-audio-v1";
+const AUDIO_ENVELOPE_STEP_SECONDS = 1 / 30;
+const ENV_DIRECTOR_VOICE_ID = process.env.NEXT_PUBLIC_ELEVENLABS_DIRECTOR_VOICE_ID?.trim() ?? "";
+const ENV_DIRECTOR_MODEL_ID =
+  process.env.NEXT_PUBLIC_ELEVENLABS_DIRECTOR_MODEL_ID?.trim() || ELEVENLABS_DEFAULT_MODEL;
+const HAS_ENV_DIRECTOR_ELEVENLABS =
+  process.env.NEXT_PUBLIC_ELEVENLABS_DIRECTOR_ENABLED === "1" && Boolean(ENV_DIRECTOR_VOICE_ID);
 
 let assetCachePromise: Promise<void> | null = null;
 
@@ -97,11 +103,55 @@ async function writeCachedAudio(cacheKey: string, blob: Blob): Promise<void> {
   );
 }
 
+async function buildAudioEnvelope(context: AudioContext, blob: Blob): Promise<Float32Array> {
+  const arrayBuffer = await blob.arrayBuffer();
+  const audioBuffer = await context.decodeAudioData(arrayBuffer);
+  const windowSize = Math.max(1, Math.floor(audioBuffer.sampleRate * AUDIO_ENVELOPE_STEP_SECONDS));
+  const windows = Math.max(1, Math.ceil(audioBuffer.length / windowSize));
+  const channels = Array.from({ length: audioBuffer.numberOfChannels }, (_, channel) =>
+    audioBuffer.getChannelData(channel),
+  );
+  const envelope = new Float32Array(windows);
+
+  for (let windowIndex = 0; windowIndex < windows; windowIndex += 1) {
+    const start = windowIndex * windowSize;
+    const end = Math.min(audioBuffer.length, start + windowSize);
+    let sumSquares = 0;
+    let count = 0;
+
+    for (const channel of channels) {
+      for (let sampleIndex = start; sampleIndex < end; sampleIndex += 1) {
+        const sample = channel[sampleIndex];
+        sumSquares += sample * sample;
+        count += 1;
+      }
+    }
+
+    envelope[windowIndex] = Math.sqrt(sumSquares / Math.max(1, count));
+  }
+
+  const sorted = Array.from(envelope).sort((a, b) => a - b);
+  const floor = sorted[Math.floor(sorted.length * 0.18)] ?? 0;
+  const normalizer = Math.max(sorted[Math.floor(sorted.length * 0.92)] ?? 0, floor + 0.01);
+  let smoothed = 0;
+
+  for (let i = 0; i < envelope.length; i += 1) {
+    const normalized = clamp((envelope[i] - floor) / (normalizer - floor), 0, 1);
+    smoothed =
+      normalized > smoothed ? smoothed * 0.18 + normalized * 0.82 : smoothed * 0.55 + normalized * 0.45;
+    envelope[i] = smoothed;
+  }
+
+  return envelope;
+}
+
 export default function DirectorPage() {
   const [draft, setDraft] = useState("");
   const [lastLine, setLastLine] = useState(INTRO_LINE);
   const [status, setStatus] = useState("ready");
-  const [engine, setEngine] = useState<SpeechEngine>("browser");
+  const [engine, setEngine] = useState<SpeechEngine>(
+    HAS_ENV_DIRECTOR_ELEVENLABS ? "elevenlabs" : "browser",
+  );
   const [stageMode, setStageMode] = useState<StageMode>("studio");
   const [showBubble, setShowBubble] = useState(true);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -110,18 +160,16 @@ export default function DirectorPage() {
   const [assetsReady, setAssetsReady] = useState(false);
 
   const apiKeyRef = useRef("");
-  const voiceIdRef = useRef("");
-  const modelIdRef = useRef(ELEVENLABS_DEFAULT_MODEL);
+  const voiceIdRef = useRef(ENV_DIRECTOR_VOICE_ID);
+  const modelIdRef = useRef(ENV_DIRECTOR_MODEL_ID);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const speechRunRef = useRef(0);
   const volumeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const analyserDataRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
-  const sourceRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const analyserRafRef = useRef<number | null>(null);
+  const lipSyncRafRef = useRef<number | null>(null);
+  const audioEnvelopeCacheRef = useRef<Map<string, Float32Array>>(new Map());
 
   useEffect(() => {
     void warmPepeAssets().then(() => setAssetsReady(true));
@@ -142,22 +190,22 @@ export default function DirectorPage() {
       if (isSpeechAvailable()) window.speechSynthesis.cancel();
       if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
       if (volumeTimerRef.current) clearInterval(volumeTimerRef.current);
-      if (analyserRafRef.current) cancelAnimationFrame(analyserRafRef.current);
+      if (lipSyncRafRef.current) cancelAnimationFrame(lipSyncRafRef.current);
       void audioContextRef.current?.close().catch(() => undefined);
     };
   }, []);
 
-  const stopAudioLevelMeter = useCallback(() => {
-    if (analyserRafRef.current) cancelAnimationFrame(analyserRafRef.current);
-    analyserRafRef.current = null;
+  const stopLipSync = useCallback(() => {
+    if (lipSyncRafRef.current) cancelAnimationFrame(lipSyncRafRef.current);
+    lipSyncRafRef.current = null;
   }, []);
 
   const stopVolume = useCallback(() => {
     if (volumeTimerRef.current) clearInterval(volumeTimerRef.current);
     volumeTimerRef.current = null;
-    stopAudioLevelMeter();
+    stopLipSync();
     setVolume(0);
-  }, [stopAudioLevelMeter]);
+  }, [stopLipSync]);
 
   const startFakeVolume = useCallback((text: string) => {
     if (volumeTimerRef.current) clearInterval(volumeTimerRef.current);
@@ -171,10 +219,7 @@ export default function DirectorPage() {
     }, 70);
   }, []);
 
-  const ensureAudioAnalyser = useCallback(async () => {
-    const audio = audioRef.current;
-    if (!audio) throw new Error("audio unavailable");
-
+  const ensureAudioContext = useCallback(async () => {
     const AudioContextCtor =
       window.AudioContext ??
       (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -183,49 +228,39 @@ export default function DirectorPage() {
     if (!audioContextRef.current) {
       audioContextRef.current = new AudioContextCtor();
     }
-    if (!sourceRef.current) {
-      const analyser = audioContextRef.current.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.58;
-
-      sourceRef.current = audioContextRef.current.createMediaElementSource(audio);
-      sourceRef.current.connect(analyser);
-      analyser.connect(audioContextRef.current.destination);
-      analyserRef.current = analyser;
-      analyserDataRef.current = new Uint8Array(analyser.frequencyBinCount);
-    }
     if (audioContextRef.current.state === "suspended") {
       await audioContextRef.current.resume();
     }
+    return audioContextRef.current;
   }, []);
 
-  const startAudioLevelMeter = useCallback(() => {
-    stopVolume();
-    const analyser = analyserRef.current;
-    const audio = audioRef.current;
-    if (!analyser || !audio) return;
+  const startAudioEnvelopeLipSync = useCallback((envelope: Float32Array | null, text: string) => {
+    if (!envelope) {
+      startFakeVolume(text);
+      return;
+    }
 
-    const data = analyserDataRef.current ?? new Uint8Array(analyser.frequencyBinCount);
-    analyserDataRef.current = data;
+    stopVolume();
+    const audio = audioRef.current;
+    if (!audio) return;
 
     const tick = () => {
       if (audio.paused || audio.ended) {
         setVolume(0);
-        analyserRafRef.current = null;
+        lipSyncRafRef.current = null;
         return;
       }
 
-      analyser.getByteFrequencyData(data);
-      let sum = 0;
-      const end = Math.min(data.length, 48);
-      for (let i = 2; i < end; i += 1) sum += data[i];
-      const avg = sum / Math.max(1, end - 2);
-      setVolume(clamp((avg - 8) / 92, 0, 1));
-      analyserRafRef.current = requestAnimationFrame(tick);
+      const frame = Math.min(
+        envelope.length - 1,
+        Math.floor(audio.currentTime / AUDIO_ENVELOPE_STEP_SECONDS),
+      );
+      setVolume(envelope[frame] ?? 0);
+      lipSyncRafRef.current = requestAnimationFrame(tick);
     };
 
-    analyserRafRef.current = requestAnimationFrame(tick);
-  }, [stopVolume]);
+    lipSyncRafRef.current = requestAnimationFrame(tick);
+  }, [startFakeVolume, stopVolume]);
 
   const stop = useCallback(() => {
     speechRunRef.current += 1;
@@ -273,7 +308,7 @@ export default function DirectorPage() {
     async (line: string, runId: number) => {
       const apiKey = apiKeyRef.current.trim();
       const voiceId = voiceIdRef.current.trim();
-      if (!apiKey || !voiceId) {
+      if ((!apiKey && !HAS_ENV_DIRECTOR_ELEVENLABS) || !voiceId) {
         setStatus("set /key and /voice before ElevenLabs speech");
         setIsSpeaking(false);
         stopVolume();
@@ -281,8 +316,6 @@ export default function DirectorPage() {
       }
 
       try {
-        await ensureAudioAnalyser();
-
         const cacheKey = await getDirectorAudioCacheKey(modelIdRef.current, voiceId, line);
         const cachedBlob = await readCachedAudio(cacheKey).catch(() => null);
         if (speechRunRef.current !== runId) return;
@@ -313,6 +346,10 @@ export default function DirectorPage() {
         } else {
           setStatus("cached audio");
         }
+        const envelope =
+          audioEnvelopeCacheRef.current.get(cacheKey) ??
+          (await buildAudioEnvelope(await ensureAudioContext(), blob).catch(() => null));
+        if (envelope) audioEnvelopeCacheRef.current.set(cacheKey, envelope);
         if (speechRunRef.current !== runId || controller.signal.aborted) return;
         if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
         const url = URL.createObjectURL(blob);
@@ -338,7 +375,7 @@ export default function DirectorPage() {
           return;
         }
         setIsSpeaking(true);
-        startAudioLevelMeter();
+        startAudioEnvelopeLipSync(envelope, line);
         setStatus("speaking");
       } catch (err) {
         if ((err as Error).name !== "AbortError" && speechRunRef.current === runId) {
@@ -350,7 +387,7 @@ export default function DirectorPage() {
         if (speechRunRef.current === runId) abortRef.current = null;
       }
     },
-    [ensureAudioAnalyser, startAudioLevelMeter, stopVolume],
+    [ensureAudioContext, startAudioEnvelopeLipSync, stopVolume],
   );
 
   const speak = useCallback(

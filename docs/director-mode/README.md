@@ -58,6 +58,17 @@ The app keeps the key in memory for the current browser session only. It does no
 
 Generated ElevenLabs audio is cached locally in the browser by model, voice, and line text. Repeating the same line avoids another network round trip and starts playback quickly. The cache does not include or persist the API key.
 
+Local `.env.local` values override slash-command values on the server:
+
+```bash
+ELEVENLABS_API_KEY=sk-...
+ELEVENLABS_DIRECTOR_VOICE_ID=Bj9UqZbhQsanLzgalpEG
+ELEVENLABS_DIRECTOR_MODEL_ID=eleven_v3
+NEXT_PUBLIC_ELEVENLABS_DIRECTOR_ENABLED=1
+NEXT_PUBLIC_ELEVENLABS_DIRECTOR_VOICE_ID=Bj9UqZbhQsanLzgalpEG
+NEXT_PUBLIC_ELEVENLABS_DIRECTOR_MODEL_ID=eleven_v3
+```
+
 ## Stage Modes
 
 Director Mode has three stage presets:

@@ -18,10 +18,13 @@ export async function POST(req: Request) {
     return Response.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const apiKey = body.apiKey?.trim();
-  const voiceId = body.voiceId?.trim();
+  const apiKey = process.env.ELEVENLABS_API_KEY?.trim() || body.apiKey?.trim();
+  const voiceId = process.env.ELEVENLABS_DIRECTOR_VOICE_ID?.trim() || body.voiceId?.trim();
   const text = body.text?.trim();
-  const modelId = body.modelId?.trim() || "eleven_flash_v2_5";
+  const modelId =
+    process.env.ELEVENLABS_DIRECTOR_MODEL_ID?.trim() ||
+    body.modelId?.trim() ||
+    "eleven_flash_v2_5";
 
   if (!apiKey) return Response.json({ error: "ElevenLabs API key required" }, { status: 400 });
   if (!voiceId) return Response.json({ error: "ElevenLabs voice ID required" }, { status: 400 });
