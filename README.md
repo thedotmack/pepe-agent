@@ -39,6 +39,20 @@ open http://localhost:3010/director
 
 For OBS Virtual Camera setup, ElevenLabs BYO-key usage, and contributor notes, see [docs/director-mode/README.md](docs/director-mode/README.md).
 
+## OpenAI-Compatible Chat
+
+The `/chat` route uses CopilotKit's chat UI and an AG-UI bridge to a server-side OpenAI-compatible endpoint.
+
+```bash
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o-mini
+npm run dev
+open http://localhost:3010/chat
+```
+
+`OPENAI_API_KEY` is read only by the Next.js API route and is never exposed to the browser. Set `AG_UI_OPENAI_AGENT_URL` if you want CopilotKit to bridge to a separate AG-UI backend instead of the local `/api/ag-ui/openai` route.
+
 ## Environment Variables
 
 | Variable | Description | Default |
@@ -50,6 +64,10 @@ For OBS Virtual Camera setup, ElevenLabs BYO-key usage, and contributor notes, s
 | `NEXT_PUBLIC_ELEVENLABS_DIRECTOR_ENABLED` | Start Director in ElevenLabs mode when set to `1` | none |
 | `NEXT_PUBLIC_ELEVENLABS_DIRECTOR_VOICE_ID` | Browser-visible Director voice id for cache keys and defaults | none |
 | `NEXT_PUBLIC_ELEVENLABS_DIRECTOR_MODEL_ID` | Browser-visible Director model id for cache keys and defaults | `eleven_flash_v2_5` |
+| `OPENAI_API_KEY` | Server-side key for `/chat` OpenAI-compatible completions | none |
+| `OPENAI_BASE_URL` | OpenAI-compatible API base URL | `https://api.openai.com/v1` |
+| `OPENAI_MODEL` | Chat model for `/chat` | `gpt-4o-mini` |
+| `AG_UI_OPENAI_AGENT_URL` | Optional remote AG-UI backend for CopilotKit | local `/api/ag-ui/openai` |
 | `ACTIVITY_WS_UPSTREAM_URL` | Upstream activity WebSocket | `wss://data.cmem.ai/activity` |
 | `ACTIVITY_REST_FALLBACK_URL` | REST fallback polled when WS is unavailable | `https://data.cmem.ai/api/activity/top/50` |
 
@@ -59,6 +77,9 @@ For OBS Virtual Camera setup, ElevenLabs BYO-key usage, and contributor notes, s
 |---|---|
 | `app/page.tsx` | Main one-screen board composition |
 | `app/api/feed/route.ts` | SSE bridge for live activity data |
+| `app/api/ag-ui/openai/route.ts` | AG-UI event stream backed by an OpenAI-compatible chat endpoint |
+| `app/api/copilotkit/route.ts` | CopilotKit runtime bridge to the AG-UI agent |
+| `app/chat/page.tsx` | CopilotKit chat UI |
 | `components/dot-board/DotMatrixCanvas.tsx` | Canvas renderer for the 108x192 matrix |
 | `components/dot-board/use-activity-feed.ts` | EventSource client store |
 | `lib/dot-matrix/render-board.ts` | Board layout and animation drawing |
