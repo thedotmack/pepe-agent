@@ -25,6 +25,7 @@ const PEPE_ASSETS = [
 
 const ELEVENLABS_DEFAULT_MODEL = "eleven_flash_v2_5";
 const INTRO_LINE = "gm, welcome back to Pepe HQ.";
+const DIRECTOR_AUDIO_CACHE = "pepe-director-elevenlabs-audio-v1";
 
 let assetCachePromise: Promise<void> | null = null;
 
@@ -58,6 +59,44 @@ function warmPepeAssets(): Promise<void> {
   return assetCachePromise;
 }
 
+async function sha256(value: string): Promise<string> {
+  if (typeof crypto === "undefined" || !crypto.subtle) {
+    let hash = 0;
+    for (let i = 0; i < value.length; i += 1) {
+      hash = (hash << 5) - hash + value.charCodeAt(i);
+      hash |= 0;
+    }
+    return `fallback-${Math.abs(hash).toString(16)}`;
+  }
+
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function getDirectorAudioCacheKey(modelId: string, voiceId: string, text: string) {
+  return sha256(`${modelId}\n${voiceId}\n${text}`);
+}
+
+async function readCachedAudio(cacheKey: string): Promise<Blob | null> {
+  if (typeof caches === "undefined") return null;
+  const cache = await caches.open(DIRECTOR_AUDIO_CACHE);
+  const res = await cache.match(`/director-audio/${cacheKey}.mp3`);
+  return res ? res.blob() : null;
+}
+
+async function writeCachedAudio(cacheKey: string, blob: Blob): Promise<void> {
+  if (typeof caches === "undefined") return;
+  const cache = await caches.open(DIRECTOR_AUDIO_CACHE);
+  await cache.put(
+    `/director-audio/${cacheKey}.mp3`,
+    new Response(blob, {
+      headers: { "Content-Type": blob.type || "audio/mpeg" },
+    }),
+  );
+}
+
 export default function DirectorPage() {
   const [draft, setDraft] = useState("");
   const [lastLine, setLastLine] = useState(INTRO_LINE);
@@ -76,7 +115,13 @@ export default function DirectorPage() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const speechRunRef = useRef(0);
   const volumeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const analyserDataRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
+  const sourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const analyserRafRef = useRef<number | null>(null);
 
   useEffect(() => {
     void warmPepeAssets().then(() => setAssetsReady(true));
@@ -97,14 +142,22 @@ export default function DirectorPage() {
       if (isSpeechAvailable()) window.speechSynthesis.cancel();
       if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
       if (volumeTimerRef.current) clearInterval(volumeTimerRef.current);
+      if (analyserRafRef.current) cancelAnimationFrame(analyserRafRef.current);
+      void audioContextRef.current?.close().catch(() => undefined);
     };
+  }, []);
+
+  const stopAudioLevelMeter = useCallback(() => {
+    if (analyserRafRef.current) cancelAnimationFrame(analyserRafRef.current);
+    analyserRafRef.current = null;
   }, []);
 
   const stopVolume = useCallback(() => {
     if (volumeTimerRef.current) clearInterval(volumeTimerRef.current);
     volumeTimerRef.current = null;
+    stopAudioLevelMeter();
     setVolume(0);
-  }, []);
+  }, [stopAudioLevelMeter]);
 
   const startFakeVolume = useCallback((text: string) => {
     if (volumeTimerRef.current) clearInterval(volumeTimerRef.current);
@@ -118,7 +171,64 @@ export default function DirectorPage() {
     }, 70);
   }, []);
 
+  const ensureAudioAnalyser = useCallback(async () => {
+    const audio = audioRef.current;
+    if (!audio) throw new Error("audio unavailable");
+
+    const AudioContextCtor =
+      window.AudioContext ??
+      (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextCtor) throw new Error("Web Audio unavailable");
+
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContextCtor();
+    }
+    if (!sourceRef.current) {
+      const analyser = audioContextRef.current.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.58;
+
+      sourceRef.current = audioContextRef.current.createMediaElementSource(audio);
+      sourceRef.current.connect(analyser);
+      analyser.connect(audioContextRef.current.destination);
+      analyserRef.current = analyser;
+      analyserDataRef.current = new Uint8Array(analyser.frequencyBinCount);
+    }
+    if (audioContextRef.current.state === "suspended") {
+      await audioContextRef.current.resume();
+    }
+  }, []);
+
+  const startAudioLevelMeter = useCallback(() => {
+    stopVolume();
+    const analyser = analyserRef.current;
+    const audio = audioRef.current;
+    if (!analyser || !audio) return;
+
+    const data = analyserDataRef.current ?? new Uint8Array(analyser.frequencyBinCount);
+    analyserDataRef.current = data;
+
+    const tick = () => {
+      if (audio.paused || audio.ended) {
+        setVolume(0);
+        analyserRafRef.current = null;
+        return;
+      }
+
+      analyser.getByteFrequencyData(data);
+      let sum = 0;
+      const end = Math.min(data.length, 48);
+      for (let i = 2; i < end; i += 1) sum += data[i];
+      const avg = sum / Math.max(1, end - 2);
+      setVolume(clamp((avg - 8) / 92, 0, 1));
+      analyserRafRef.current = requestAnimationFrame(tick);
+    };
+
+    analyserRafRef.current = requestAnimationFrame(tick);
+  }, [stopVolume]);
+
   const stop = useCallback(() => {
+    speechRunRef.current += 1;
     abortRef.current?.abort();
     abortRef.current = null;
     if (audioRef.current) {
@@ -132,7 +242,7 @@ export default function DirectorPage() {
   }, [stopVolume]);
 
   const speakWithBrowser = useCallback(
-    (line: string) => {
+    (line: string, runId: number) => {
       if (!isSpeechAvailable()) {
         setStatus("browser speech unavailable; use /engine elevenlabs");
         return;
@@ -143,11 +253,13 @@ export default function DirectorPage() {
       utterance.pitch = 0.82;
       utterance.volume = 1;
       utterance.onend = () => {
+        if (speechRunRef.current !== runId) return;
         setIsSpeaking(false);
         stopVolume();
         setStatus("ready");
       };
       utterance.onerror = () => {
+        if (speechRunRef.current !== runId) return;
         setIsSpeaking(false);
         stopVolume();
         setStatus("speech stopped");
@@ -158,7 +270,7 @@ export default function DirectorPage() {
   );
 
   const speakWithElevenLabs = useCallback(
-    async (line: string) => {
+    async (line: string, runId: number) => {
       const apiKey = apiKeyRef.current.trim();
       const voiceId = voiceIdRef.current.trim();
       if (!apiKey || !voiceId) {
@@ -168,27 +280,40 @@ export default function DirectorPage() {
         return;
       }
 
-      const controller = new AbortController();
-      abortRef.current = controller;
-      setStatus("making audio");
       try {
-        const res = await fetch("/api/director/elevenlabs/tts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            apiKey,
-            voiceId,
-            modelId: modelIdRef.current,
-            text: line,
-          }),
-          signal: controller.signal,
-          cache: "no-store",
-        });
-        if (!res.ok) {
-          const details = await res.json().catch(() => null);
-          throw new Error(details?.error ?? `ElevenLabs TTS failed with ${res.status}`);
+        await ensureAudioAnalyser();
+
+        const cacheKey = await getDirectorAudioCacheKey(modelIdRef.current, voiceId, line);
+        const cachedBlob = await readCachedAudio(cacheKey).catch(() => null);
+        if (speechRunRef.current !== runId) return;
+        let blob = cachedBlob;
+        const controller = new AbortController();
+        abortRef.current = controller;
+
+        if (!blob) {
+          setStatus("making audio");
+          const res = await fetch("/api/director/elevenlabs/tts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              apiKey,
+              voiceId,
+              modelId: modelIdRef.current,
+              text: line,
+            }),
+            signal: controller.signal,
+            cache: "no-store",
+          });
+          if (!res.ok) {
+            const details = await res.json().catch(() => null);
+            throw new Error(details?.error ?? `ElevenLabs TTS failed with ${res.status}`);
+          }
+          blob = await res.blob();
+          void writeCachedAudio(cacheKey, blob).catch(() => undefined);
+        } else {
+          setStatus("cached audio");
         }
-        const blob = await res.blob();
+        if (speechRunRef.current !== runId || controller.signal.aborted) return;
         if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
         const url = URL.createObjectURL(blob);
         audioUrlRef.current = url;
@@ -196,28 +321,36 @@ export default function DirectorPage() {
         if (!audio) throw new Error("audio unavailable");
         audio.src = url;
         audio.onended = () => {
+          if (speechRunRef.current !== runId) return;
           setIsSpeaking(false);
           stopVolume();
           setStatus("ready");
         };
         audio.onerror = () => {
+          if (speechRunRef.current !== runId) return;
           setIsSpeaking(false);
           stopVolume();
           setStatus("audio playback failed");
         };
         await audio.play();
+        if (speechRunRef.current !== runId) {
+          audio.pause();
+          return;
+        }
+        setIsSpeaking(true);
+        startAudioLevelMeter();
         setStatus("speaking");
       } catch (err) {
-        if ((err as Error).name !== "AbortError") {
+        if ((err as Error).name !== "AbortError" && speechRunRef.current === runId) {
           setStatus((err as Error).message);
           setIsSpeaking(false);
           stopVolume();
         }
       } finally {
-        abortRef.current = null;
+        if (speechRunRef.current === runId) abortRef.current = null;
       }
     },
-    [stopVolume],
+    [ensureAudioAnalyser, startAudioLevelMeter, stopVolume],
   );
 
   const speak = useCallback(
@@ -225,12 +358,19 @@ export default function DirectorPage() {
       const text = line.trim();
       if (!text) return;
       stop();
+      const runId = speechRunRef.current + 1;
+      speechRunRef.current = runId;
       setLastLine(text);
-      setIsSpeaking(true);
-      setStatus(engine === "elevenlabs" ? "making audio" : "speaking");
-      startFakeVolume(text);
-      if (engine === "elevenlabs") void speakWithElevenLabs(text);
-      else speakWithBrowser(text);
+      if (engine === "elevenlabs") {
+        setIsSpeaking(false);
+        setStatus("checking audio cache");
+        void speakWithElevenLabs(text, runId);
+      } else {
+        setIsSpeaking(true);
+        setStatus("speaking");
+        startFakeVolume(text);
+        speakWithBrowser(text, runId);
+      }
     },
     [engine, speakWithBrowser, speakWithElevenLabs, startFakeVolume, stop],
   );

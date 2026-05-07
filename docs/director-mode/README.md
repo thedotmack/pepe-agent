@@ -20,7 +20,7 @@ Use Chrome for the most reliable browser speech voices and OBS Browser Source su
 2. Type a sentence in the bottom input.
 3. Press Enter.
 
-Pepe lip-syncs while the audio plays. The page preloads the full Pepe sprite and eye asset set before showing the character, so frame swaps do not flash during a recording.
+Pepe lip-syncs while the audio plays. ElevenLabs playback drives the mouth from the real audio signal; browser speech uses estimated lip sync because the browser API does not expose its output stream. The page preloads the full Pepe sprite and eye asset set before showing the character, so frame swaps do not flash during a recording.
 
 ## Commands
 
@@ -55,6 +55,8 @@ The key is sent only to the local Next.js API route for that request:
 - `POST /api/director/elevenlabs/tts`
 
 The app keeps the key in memory for the current browser session only. It does not persist the key in localStorage, repo files, or environment variables.
+
+Generated ElevenLabs audio is cached locally in the browser by model, voice, and line text. Repeating the same line avoids another network round trip and starts playback quickly. The cache does not include or persist the API key.
 
 ## Stage Modes
 

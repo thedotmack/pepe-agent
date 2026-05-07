@@ -1,6 +1,6 @@
 # Pepe Director Camera
 
-`/director` is a live-performance page for screencasts and calls. Type a line, press Enter, and Pepe lip-syncs while the browser or ElevenLabs speaks the line.
+`/director` is a live-performance page for screencasts and calls. Type a line, press Enter, and Pepe lip-syncs while the browser or ElevenLabs speaks the line. ElevenLabs audio is cached locally by model, voice, and line text so repeated takes start quickly.
 
 ## Local Run
 
@@ -21,6 +21,8 @@ Pepe Director supports contributor-owned ElevenLabs keys:
 4. Type a normal sentence and press Enter.
 
 The key is sent to the local Next.js route for each TTS request and is not persisted in localStorage, repo files, or environment variables.
+
+ElevenLabs lip sync follows the actual audio playback signal. Browser speech falls back to estimated lip sync because `speechSynthesis` does not expose its audio stream.
 
 ## OBS Virtual Camera
 
