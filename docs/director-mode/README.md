@@ -17,30 +17,44 @@ Use Chrome for the most reliable browser speech voices and OBS Browser Source su
 ## Make Pepe Talk
 
 1. Open `/director`.
-2. Type a line in the `Line` box.
-3. Choose a voice engine:
-   - `Browser`: no setup, uses `window.speechSynthesis`.
-   - `ElevenLabs`: paste your own API key and voice ID.
-4. Press `Speak`.
+2. Type a sentence in the bottom input.
+3. Press Enter.
 
-Pepe lip-syncs while the audio plays. The `Stop` button cancels the current line. `Add to Queue` lets you stack lines for a longer screencast.
+Pepe lip-syncs while the audio plays. The page preloads the full Pepe sprite and eye asset set before showing the character, so frame swaps do not flash during a recording.
+
+## Commands
+
+Director Mode keeps the screen clean. Configuration is done through slash commands in the same input:
+
+| Command | Example |
+|---|---|
+| `/help` | Show the command list in the status text. |
+| `/stop` | Stop the current line. |
+| `/engine browser` | Use built-in browser speech. |
+| `/engine elevenlabs` | Use ElevenLabs TTS. |
+| `/key <api-key>` | Set your ElevenLabs API key for this session. |
+| `/voice <voice-id>` | Set the ElevenLabs voice ID for this session. |
+| `/model <model-id>` | Set the ElevenLabs model, defaults to `eleven_flash_v2_5`. |
+| `/stage studio` | Use the branded studio background. |
+| `/stage camera` | Use a black camera background. |
+| `/stage chroma` | Use a green chroma key background. |
+| `/bubble off` | Hide the speech bubble. Use `/bubble on` to restore it. |
 
 ## ElevenLabs BYO Key
 
 Director Mode is open-source friendly: contributors can use their own ElevenLabs key without changing repo config.
 
-1. Switch the voice engine to `ElevenLabs`.
-2. Paste your ElevenLabs API key.
-3. Click `Load` to fetch voices for that key, or paste a voice ID directly.
-4. Pick a model.
-5. Press `Speak`.
+1. Type `/key <your-elevenlabs-api-key>` and press Enter.
+2. Type `/voice <your-elevenlabs-voice-id>` and press Enter.
+3. Optionally type `/model eleven_flash_v2_5`.
+4. Type a normal sentence and press Enter.
 
 The key is sent only to the local Next.js API route for that request:
 
 - `POST /api/director/elevenlabs/voices`
 - `POST /api/director/elevenlabs/tts`
 
-The app does not persist the key in localStorage, repo files, or environment variables.
+The app keeps the key in memory for the current browser session only. It does not persist the key in localStorage, repo files, or environment variables.
 
 ## Stage Modes
 
@@ -52,7 +66,7 @@ Director Mode has three stage presets:
 | `camera` | Black background for a clean webcam-style feed. |
 | `chroma` | Bright green background for chroma key workflows. |
 
-The `Bubble` toggle controls the speech bubble above Pepe. The lower caption bar stays visible for readability in recordings.
+Use `/bubble on` or `/bubble off` to control the speech bubble above Pepe. The lower caption bar stays visible for readability in recordings.
 
 ## Use in Zoom, Google Meet, Discord, or Any Mac App
 
@@ -63,7 +77,7 @@ The practical virtual camera path is OBS Virtual Camera.
 3. In OBS, add a `Browser Source`.
 4. Set the URL to `http://localhost:3010/director`.
 5. Set the source size to `1920x1080`.
-6. In `/director`, choose `camera` or `chroma`.
+6. In `/director`, type `/stage camera` or `/stage chroma`.
 7. In OBS, click `Start Virtual Camera`.
 8. In Zoom, Google Meet, Discord, or another app, select `OBS Virtual Camera`.
 
