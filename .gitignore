@@ -10,3 +10,9 @@ node_modules/
 # trade ledger + agent SDK session state (local + container volumes)
 .data/
 .sessions/
+
+# Phase 6 / audit finding #10: worker secrets must never land in git.
+# Phase 8 (O1): broadened to .env* — catches .env.local, .env.devnet,
+# .env.mainnet, .env.dev, etc. If we ever add a `worker/.env.example`,
+# explicitly un-ignore it with `!worker/.env.example` below.
+worker/.env*

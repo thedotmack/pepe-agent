@@ -16,16 +16,46 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { ActivitySubscriber, ActivityToken } from "../../activity/subscriber.ts";
 import type { TradeIntent, PolicyResult } from "../../trade/policy.ts";
-import { DEFAULT_SLIPPAGE_BPS, SLIPPAGE_HARD_CAP_BPS, PER_TRADE_MAX_SOL } from "../../trade/policy.ts";
+import {
+  DEFAULT_SLIPPAGE_BPS,
+  SLIPPAGE_HARD_CAP_BPS,
+  PER_TRADE_MAX_SOL,
+  checkRouteLiquidity,
+} from "../../trade/policy.ts";
 import type { TradeLedger } from "../../trade/ledger.ts";
-import { executeTrade, getQuote as jupGetQuote } from "../../trade/jupiter.ts";
+import { executeTrade, getQuote as jupGetQuote, defaultRpcUrl } from "../../trade/jupiter.ts";
+// spl-token getMint signature: getMint(connection, mintPubkey) → { decimals, ... }.
+// Phase 11 (codex Phase 10 re-audit #4): also need getAccount +
+// getAssociatedTokenAddressSync + TokenAccountNotFoundError so the BUY flow
+// can read the actual on-chain ATA balance post-confirm instead of trusting
+// the quote.outAmount promise (which is the QUOTED output, not the
+// slippage-adjusted reality).
+import {
+  getMint,
+  getAccount,
+  getAssociatedTokenAddressSync,
+  TokenAccountNotFoundError,
+} from "@solana/spl-token";
+import { Connection, PublicKey } from "@solana/web3.js";
+import { getPublicKey } from "../../trade/wallet.ts";
 import type { ClaudeMemClient } from "../../memory/claude-mem-client.ts";
-import type { StateStore } from "../../state.ts";
+import type { StateStore, KillSwitchRef as StateKillSwitchRef } from "../../state.ts";
 import { createLogger } from "../../logger.ts";
+// Phase 12 (codex Phase 11 re-audit blocker #1): wrap the pre-BUY and
+// post-BUY ATA reads in the same 10s RPC timeout as the position-monitor's
+// backfill. A hung getAccount call would otherwise wedge the trade handler
+// AFTER a confirmed swap on the wire — wallet changed, but ledger never
+// records. Same constant + helper as position-monitor so an operator only
+// learns one number.
+import { withRpcTimeout } from "../position-monitor.ts";
 
 const log = createLogger("agent.tools");
 
-export type KillSwitchRef = { tripped: boolean };
+// Re-export under the legacy name so loop.ts (which imports KillSwitchRef
+// from this module) keeps working. Phase 4: the shape now exposes
+// `signal: AbortSignal` and `trip()` / `reset()`. Tool handler only reads
+// `tripped` + `signal` — the trip()/reset() side is server-owned.
+export type KillSwitchRef = StateKillSwitchRef;
 
 export interface CreatePepeMcpServerArgs {
   subscriber: ActivitySubscriber;
@@ -46,9 +76,97 @@ function rankToken(t: ActivityToken): number {
   return gain * 1000 + vol / 1_000_000;
 }
 
-export function createPepeMcpServer(
-  args: CreatePepeMcpServerArgs
-): McpSdkServerConfigWithInstance {
+/**
+ * Phase 12 (codex Phase 11 re-audit blocker #1): read the post-BUY ATA
+ * balance and return the delta over the pre-BUY balance. This is the EXACT
+ * on-chain quantity that landed, after slippage.
+ *
+ * Phase 11 had two issues codex flagged:
+ *   - the getAccount call was UNBOUNDED (no timeout) — a hung RPC after a
+ *     confirmed BUY would wedge the trade handler with the swap already on
+ *     the wire and the position never recorded.
+ *   - any failure path (timeout / TokenAccountNotFoundError / other) fell
+ *     back to BigInt(quote.outAmount) and persisted THAT as the position
+ *     row's tokensReceivedAtomic. That's the QUOTED output, not the
+ *     slippage-adjusted reality — and worse, position-monitor's lazy
+ *     backfill only fires on rows where tokensReceivedAtomic === "0", so
+ *     storing a plausible-looking quote value LOSES SLIPPAGE TRUTH FOREVER.
+ *
+ * Phase 12 fix:
+ *   1. Wrap getAccount in withRpcTimeout (same 10s ceiling as
+ *      position-monitor) so the handler can't hang post-confirm.
+ *   2. On ANY failure path (timeout, TokenAccountNotFound, other, or a
+ *      non-positive delta), return 0n. The position-monitor backfills "0"
+ *      rows from the actual ATA on the next tick, so a transient RPC blip
+ *      self-heals within ~10s.
+ *   3. Never persist BigInt(quote.outAmount). quote.outAmount remains
+ *      useful for telemetry (we log it on failure), but the persisted value
+ *      is either (a) the real on-chain delta, or (b) the 0n sentinel
+ *      waiting for backfill — never the quoted promise.
+ *
+ * Why post-confirm-balance over quote.outAmount:
+ *   - quote.outAmount is the QUOTED output (best-case fill).
+ *   - actual on-chain fill is up to slippageBps below quoted (default 100bps
+ *     ⇒ up to 1% less).
+ *   - storing the quote value overstates the position size, causing later
+ *     SELL paths to over-request and hit insufficient_token_balance on exit.
+ */
+async function readPostBuyDelta(
+  outputMint: string,
+  preBuyBalance: bigint,
+  quoteOutAmount: string,
+  txid: string,
+): Promise<bigint> {
+  try {
+    const rpc = new Connection(defaultRpcUrl(), "confirmed");
+    const ownerPk = new PublicKey(getPublicKey());
+    const ata = getAssociatedTokenAddressSync(new PublicKey(outputMint), ownerPk);
+    // Phase 12 blocker #1: bound the post-confirm getAccount with the same
+    // 10s ceiling as position-monitor's backfill. Without this an
+    // unreachable RPC would keep the handler hanging after the swap
+    // already landed.
+    const acct = await withRpcTimeout(
+      getAccount(rpc, ata),
+      `post-BUY getAccount(${outputMint})`,
+    );
+    const delta = acct.amount - preBuyBalance;
+    if (delta > 0n) return delta;
+    // Defensive: a non-positive delta on a confirmed BUY means either
+    // (a) we misread the pre-balance (race with another process touching
+    // the same ATA — shouldn't happen but isn't impossible), or
+    // (b) the tx landed but the swap somehow netted to 0 tokens — also
+    // shouldn't happen for an "ok" status. Phase 12 (#1): return the 0n
+    // sentinel so position-monitor's lazy backfill recovers the real value
+    // from chain on the next tick. Persisting BigInt(quote.outAmount) would
+    // hide the truth permanently.
+    log.warn(
+      `post-BUY delta non-positive (${delta.toString()}) for ${outputMint} txid=${txid}; ` +
+        `quote.outAmount=${String(quoteOutAmount)} (NOT persisted); ` +
+        `storing 0n sentinel for position-monitor backfill`,
+    );
+    return 0n;
+  } catch (err) {
+    // Phase 12 (#1): timeout, TokenAccountNotFoundError, or any other RPC
+    // failure all converge here. Persist the 0n sentinel — never the quote
+    // promise — so the position-monitor backfills with the real chain value
+    // on its next tick (typically within 10s).
+    log.warn(
+      `post-BUY balance read failed for ${outputMint} txid=${txid} (${String(err)}); ` +
+        `quote.outAmount=${String(quoteOutAmount)} (NOT persisted); ` +
+        `storing 0n sentinel for position-monitor backfill`,
+    );
+    return 0n;
+  }
+}
+
+/**
+ * Phase 7 H3: build the raw SdkMcpToolDefinition[] from the same args
+ * shape. Exposed so tests can invoke a tool's `.handler(input, undefined)`
+ * directly without going through the MCP transport layer. Production
+ * boot still wraps these via createSdkMcpServer in createPepeMcpServer
+ * below.
+ */
+export function createPepeTools(args: CreatePepeMcpServerArgs) {
   const {
     subscriber,
     tradePolicyCheck,
@@ -130,11 +248,13 @@ export function createPepeMcpServer(
 
   const submitTrade = tool(
     "submit_trade",
-    "Sign + submit a swap. Gated by trade-policy + PreToolUse hook + canUseTool. Provide a one-sentence `reason` Pepe can narrate.",
+    "Sign + submit a swap. `side` defaults to BUY (SOL→token, takes `amountSol`). For SELL pass `side=\"SELL\"`, `tokenIn=<mint>`, `tokenOut=\"SOL\"`, and `sellAmountTokens` in UI units (the exact value from get_open_positions if exiting a known position). Gated by trade-policy + PreToolUse hook + canUseTool. Provide a one-sentence `reason` Pepe can narrate.",
     {
       tokenIn: z.string().min(3),
       tokenOut: z.string().min(3),
-      amountSol: z.number().positive().max(PER_TRADE_MAX_SOL),
+      side: z.enum(["BUY", "SELL"]).default("BUY"),
+      amountSol: z.number().positive().max(PER_TRADE_MAX_SOL).optional(),
+      sellAmountTokens: z.number().positive().optional(),
       slippageBps: z
         .number()
         .int()
@@ -147,6 +267,8 @@ export function createPepeMcpServer(
       // Phase 5: flash dot-matrix during the attempt — flip BEFORE policy check.
       stateStore.setPhase("TRADING");
 
+      const side = input.side;
+
       // Defense-in-depth: even if hook + canUseTool somehow let this through,
       // the handler re-checks the policy.
       if (killSwitchRef.tripped) {
@@ -156,16 +278,46 @@ export function createPepeMcpServer(
           action: "PASS",
           reason: "kill switch tripped",
         });
-        stateStore.setPhase("WATCHING");
+        stateStore.recordTradeResult("kill switch tripped", {
+          side,
+          outcome: "denied_kill_switch",
+        });
         return {
           content: [{ type: "text", text: "denied: kill switch is tripped" }],
           isError: true,
         };
       }
+
+      if (side === "BUY" && input.amountSol === undefined) {
+        stateStore.recordTradeResult("BUY requires amountSol", {
+          side,
+          outcome: "denied_missing_amount",
+        });
+        return {
+          content: [{ type: "text", text: "denied: BUY requires amountSol" }],
+          isError: true,
+        };
+      }
+      if (side === "SELL" && input.sellAmountTokens === undefined) {
+        stateStore.recordTradeResult("SELL requires sellAmountTokens", {
+          side,
+          outcome: "denied_missing_amount",
+        });
+        return {
+          content: [{ type: "text", text: "denied: SELL requires sellAmountTokens" }],
+          isError: true,
+        };
+      }
+
+      // Phase 5: TradeIntent now carries `side` so checkTradePolicy can
+      // apply BUY-only gates (TANK_EMPTY, per-trade cap, daily cap) without
+      // a handler-side carve-out. SELL intent has amountSol=0 by convention
+      // (a SELL produces SOL; it doesn't consume it) — policy ignores it.
       const intent: TradeIntent = {
+        side,
         tokenIn: input.tokenIn,
         tokenOut: input.tokenOut,
-        amountSol: input.amountSol,
+        amountSol: side === "BUY" ? (input.amountSol as number) : 0,
         slippageBps: input.slippageBps,
         reason: input.reason,
       };
@@ -177,33 +329,486 @@ export function createPepeMcpServer(
           action: "PASS",
           reason: decision.reason,
         });
-        stateStore.setPhase("WATCHING");
+        stateStore.recordTradeResult(`policy: ${decision.reason}`, {
+          side,
+          outcome: "denied_policy",
+        });
         return {
           content: [{ type: "text", text: `denied: ${decision.reason}` }],
           isError: true,
         };
       }
 
-      let txid: string;
-      let executedPriceSolPerToken: number | null;
+      // Both BUY and SELL need mint decimals: BUY persists them on the
+      // position row so position-monitor's price math is unit-correct; SELL
+      // converts UI tokens → atomic uint64 for Jupiter. Anti-pattern guard
+      // from PLAN-real-go-live.md Phase 1 / Phase 3: never hardcode decimals.
+      let sellAmountAtomic: bigint | undefined;
+      let mintDecimals: number | undefined;
       try {
-        const result = await executeTrade({
+        const rpc = new Connection(defaultRpcUrl(), "confirmed");
+        // BUY: decimals of tokenOut (the bought token).
+        // SELL: decimals of tokenIn (the sold token == position mint).
+        const mintForDecimals = side === "BUY" ? input.tokenOut : input.tokenIn;
+        // Phase 13 (codex Phase 12 re-audit blocker): bound the pre-trade
+        // getMint with the same 10s ceiling as position-monitor's backfill.
+        // Without this an unreachable RPC would wedge the trade handler
+        // BEFORE we sign — burning an agent turn on RPC weather. spl-token
+        // has no overall-await timeout, so we wrap via withRpcTimeout (same
+        // helper as the post-BUY ATA read + position-monitor's backfill so
+        // an operator only learns one number).
+        const mintInfo = await withRpcTimeout(
+          getMint(rpc, new PublicKey(mintForDecimals)),
+          `submit_trade getMint(${mintForDecimals})`,
+        );
+        mintDecimals = mintInfo.decimals;
+      } catch (err) {
+        // Phase 13: timeout, mint-not-found, or any other RPC failure all
+        // converge here. Record decision PASS + trade-result with a
+        // dedicated outcome so /phase-events distinguishes "metadata
+        // unavailable, retry next turn" from a hard rejection. The agent
+        // retries on its next turn once RPC recovers — same fail-closed
+        // posture as the preview-quote gate.
+        log.warn(`getMint failed for ${side} ${input.tokenIn}→${input.tokenOut}: ${String(err)}`);
+        stateStore.recordDecision({
+          ts: Date.now(),
+          symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+          action: "PASS",
+          reason: `mint metadata unavailable: ${String(err)}`,
+        });
+        stateStore.recordTradeResult(`mint metadata unavailable: ${String(err)}`, {
+          side,
+          outcome: "denied_mint_metadata_timeout",
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `denied: mint metadata unavailable, retry: ${String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (side === "SELL") {
+        const atomicPerToken = 10n ** BigInt(mintDecimals);
+        // Floor: don't request more than the user asked, even if float repr
+        // would round up.
+        const ui = input.sellAmountTokens as number;
+        const whole = BigInt(Math.floor(ui));
+        const frac = BigInt(Math.floor((ui - Math.floor(ui)) * Number(atomicPerToken)));
+        sellAmountAtomic = whole * atomicPerToken + frac;
+        if (sellAmountAtomic <= 0n) {
+          stateStore.recordTradeResult("SELL amount rounds to 0", {
+            side,
+            outcome: "denied_zero_amount",
+          });
+          return {
+            content: [{ type: "text", text: "denied: SELL amount rounds to 0 atomic units" }],
+            isError: true,
+          };
+        }
+      }
+
+      // Phase 11 (codex Phase 10 re-audit #3): route-liquidity gate.
+      // Auto-tick prefilters candidates by liquidity / buy-pressure / 5m gain
+      // before suggesting them to the agent, but a /chat-driven trade attempt
+      // skips that prefilter entirely — the agent can steer toward any mint.
+      // This gate puts the floor back: a preview quote with no route OR a
+      // priceImpactPct over the 50% hard ceiling is denied here, regardless
+      // of how the agent picked the mint. Denial happens BEFORE we sign and
+      // broadcast, so it costs only the Jupiter /quote roundtrip.
+      //
+      // The trade goes through with a fresh quote inside executeTrade — by
+      // the time we get to network the route may differ slightly, but the
+      // structural check (route exists + impact bounded) is the same. Race
+      // window is small (<100ms typical), and the gate is sufficient to
+      // match auto-tick's prefilter intent at the trade boundary.
+      try {
+        // Mirror executeTrade's amountAtomic computation so the preview quote
+        // matches what executeTrade will fetch:
+        //   BUY  → SOL atomic units (lamports = round(amountSol * 1e9))
+        //   SELL → input-token atomic uint64 (computed above)
+        const previewAmount =
+          side === "BUY"
+            ? BigInt(Math.round((input.amountSol as number) * 1e9)).toString()
+            : (sellAmountAtomic as bigint).toString();
+        const previewQuote = await jupGetQuote({
           inputMint: input.tokenIn,
           outputMint: input.tokenOut,
-          amountSol: input.amountSol,
+          amount: previewAmount,
           slippageBps: input.slippageBps,
         });
-        txid = result.txid;
-        executedPriceSolPerToken = result.executedPriceSolPerToken;
+        const liquidity = checkRouteLiquidity(previewQuote);
+        if (!liquidity.allow) {
+          log.warn(
+            `submit_trade route-liquidity denied: ${liquidity.reason} for ${input.tokenIn}→${input.tokenOut}`,
+          );
+          stateStore.recordDecision({
+            ts: Date.now(),
+            symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+            action: "PASS",
+            reason: `route-liquidity: ${liquidity.reason}`,
+          });
+          stateStore.recordTradeResult(`route-liquidity: ${liquidity.reason}`, {
+            side,
+            outcome: "denied_route_liquidity",
+          });
+          return {
+            content: [
+              { type: "text", text: `denied: ${liquidity.reason}` },
+            ],
+            isError: true,
+          };
+        }
+      } catch (err) {
+        // Phase 12 (codex Phase 11 re-audit blocker #2a): FAIL CLOSED. Phase
+        // 11 logged a warn and proceeded into executeTrade — codex correctly
+        // pointed out that a Jupiter blip on the preview /quote would let a
+        // no-route trade slip past the gate, because executeTrade's internal
+        // /quote was never route-checked before /swap. Phase 12 closes both
+        // gaps: the internal quote is now also gated (route_liquidity_denied
+        // variant), and the preview failure path denies the trade here. The
+        // agent retries on the next turn once Jupiter recovers. Trade-off:
+        // a one-shot Jupiter outage delays a legitimate trade by one tick,
+        // which is the right side to err on for a real-money loop.
+        log.warn(
+          `submit_trade preview quote unavailable (failing closed): ${String(err)}`,
+        );
+        stateStore.recordDecision({
+          ts: Date.now(),
+          symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+          action: "PASS",
+          reason: `preview quote unavailable: ${String(err)}`,
+        });
+        stateStore.recordTradeResult(`preview quote unavailable: ${String(err)}`, {
+          side,
+          outcome: "denied_preview_quote_unavailable",
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `denied: preview quote unavailable (retry on next turn): ${String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Phase 4: tight kill switch check just before send. The PreToolUse
+      // hook + canUseTool both check kill switch state at decision time, but
+      // a /kill that races between those gates and this line would otherwise
+      // slip through. Cheap to re-check; expensive to be wrong.
+      if (killSwitchRef.tripped) {
+        log.warn("submit_trade aborted pre-send: kill switch tripped mid-trade");
+        stateStore.recordDecision({
+          ts: Date.now(),
+          symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+          action: "PASS",
+          reason: "kill switch tripped mid-trade (pre-send)",
+        });
+        stateStore.recordTradeResult("kill switch tripped mid-trade (pre-send)", {
+          side,
+          outcome: "denied_kill_switch_mid",
+        });
+        return {
+          content: [{ type: "text", text: "denied: kill switch tripped mid-trade" }],
+          isError: true,
+        };
+      }
+
+      let txid: string;
+      let executedPriceSolPerToken: number | null;
+      // Phase 11 (codex Phase 10 re-audit #4): track the exact uint64 of
+      // non-SOL tokens received on a BUY by reading the on-chain ATA balance
+      // delta around the trade, NOT by trusting quote.outAmount.
+      // quote.outAmount is the QUOTED output Jupiter promised, which differs
+      // from the slippage-adjusted real value that landed on-chain (especially
+      // with the 100bps default slippage tolerance — actual fill can be
+      // anywhere up to 1% below quoted). Storing the quote value would
+      // overstate the position size and cause SELL paths to over-request,
+      // hitting insufficient_token_balance on exit.
+      //
+      // Pre-BUY ATA balance is captured here (may be 0n if the ATA doesn't
+      // exist yet — common for a fresh mint, Jupiter creates it during the
+      // swap with wrapAndUnwrapSol). Post-BUY balance is read after
+      // executeTrade returns "ok" / "landed_after_timeout". Delta is what
+      // landed on-chain. SELL path is unaffected — its tokensReceivedAtomic
+      // was set at the prior BUY.
+      let tokensReceivedAtomic: bigint = 0n;
+      let preBuyBalance: bigint = 0n;
+      if (side === "BUY") {
+        try {
+          const rpc = new Connection(defaultRpcUrl(), "confirmed");
+          const ownerPk = new PublicKey(getPublicKey());
+          const ata = getAssociatedTokenAddressSync(
+            new PublicKey(input.tokenOut),
+            ownerPk,
+          );
+          // Phase 12 (codex Phase 11 re-audit blocker #1): bound the pre-BUY
+          // ATA read with the same 10s ceiling as position-monitor's
+          // backfill. A hung getAccount here would stall BEFORE we sign,
+          // wasting an agent turn on RPC weather. Same withRpcTimeout
+          // helper as the post-BUY read so failure modes are uniform.
+          const acct = await withRpcTimeout(
+            getAccount(rpc, ata),
+            `pre-BUY getAccount(${input.tokenOut})`,
+          );
+          preBuyBalance = acct.amount;
+        } catch (err) {
+          // Most common case: ATA doesn't exist yet (Jupiter will create it
+          // during the swap). TokenAccountNotFoundError ⇒ pre-balance is 0n,
+          // which is the correct value. Other errors (including timeout
+          // from the withRpcTimeout wrap) get logged but don't abort the
+          // trade — preBuyBalance stays 0n. The post-BUY read will produce
+          // the real delta on success, or store the 0n sentinel for
+          // position-monitor backfill on failure. Either way, we never
+          // persist BigInt(quote.outAmount). Phase 12 blocker #1.
+          if (!(err instanceof TokenAccountNotFoundError)) {
+            log.warn(
+              `pre-BUY balance read failed for ${input.tokenOut} (preBuyBalance=0n; post-BUY delta or 0n sentinel will be persisted): ${String(err)}`,
+            );
+          }
+        }
+      }
+      // landedLate is true only on the "landed_after_timeout" path — caller
+      // records the trade and closes the position (it did land) but notes
+      // the late-landing in the reason for downstream reconciliation.
+      let landedLate = false;
+      try {
+        // Phase 4: thread killSwitchRef.signal as externalSignal so a /kill
+        // during the rebroadcast/confirm loop aborts the loop, signAndSend
+        // returns not_landed, and we report execute-failed below.
+        const result = await executeTrade(
+          side === "BUY"
+            ? {
+                inputMint: input.tokenIn,
+                outputMint: input.tokenOut,
+                amountSol: input.amountSol as number,
+                slippageBps: input.slippageBps,
+                decimals: mintDecimals as number,
+                externalSignal: killSwitchRef.signal,
+              }
+            : {
+                inputMint: input.tokenIn,
+                outputMint: input.tokenOut,
+                sellAmountAtomic: sellAmountAtomic as bigint,
+                slippageBps: input.slippageBps,
+                decimals: mintDecimals as number,
+                externalSignal: killSwitchRef.signal,
+              },
+        );
+        switch (result.status) {
+          case "ok":
+            txid = result.txid;
+            executedPriceSolPerToken = result.executedPriceSolPerToken;
+            // Phase 12 (codex Phase 11 re-audit blocker #1): read post-confirm
+            // ATA balance for the actual delta. On any failure (timeout,
+            // TokenAccountNotFound, other), readPostBuyDelta returns the 0n
+            // sentinel so position-monitor's lazy backfill recovers the real
+            // value from chain on the next tick. We never persist
+            // BigInt(quote.outAmount) — that would lose slippage truth
+            // permanently because backfill only fires on "0" rows. SELL path
+            // unaffected (its tokensReceivedAtomic was set at the BUY).
+            if (side === "BUY") {
+              tokensReceivedAtomic = await readPostBuyDelta(
+                input.tokenOut,
+                preBuyBalance,
+                result.quote.outAmount,
+                result.txid,
+              );
+            }
+            break;
+          case "landed_after_timeout":
+            // Tx landed on-chain but confirmTransaction missed it. Record
+            // the trade + close the position (the on-chain effect happened)
+            // and flag it for human-reviewable reconciliation.
+            log.warn(
+              `submit_trade landed_after_timeout txid=${result.txid} status=${JSON.stringify(result.value)}`,
+            );
+            txid = result.txid;
+            executedPriceSolPerToken = result.executedPriceSolPerToken;
+            // Phase 12 (#1): same as "ok" — the tx did land, so reading the
+            // post-confirm ATA delta gives the real on-chain quantity. On
+            // failure, the 0n sentinel + position-monitor backfill recover
+            // the truth; we never persist the quote promise.
+            if (side === "BUY") {
+              tokensReceivedAtomic = await readPostBuyDelta(
+                input.tokenOut,
+                preBuyBalance,
+                result.quote.outAmount,
+                result.txid,
+              );
+            }
+            landedLate = true;
+            break;
+          case "no_token_account": {
+            log.warn(`submit_trade no_token_account: ${result.reason}`);
+            stateStore.recordDecision({
+              ts: Date.now(),
+              symbol: input.tokenIn.slice(0, 8),
+              action: "PASS",
+              reason: `no_token_account: ${result.reason}`,
+            });
+            stateStore.recordTradeResult(`no_token_account: ${result.reason}`, {
+              side,
+              outcome: "no_token_account",
+            });
+            return {
+              content: [
+                { type: "text", text: `execute-failed: no_token_account: ${result.reason}` },
+              ],
+              isError: true,
+            };
+          }
+          case "insufficient_token_balance": {
+            // Phase 7 H1: distinct from no_token_account. ATA exists but
+            // holds less than requested. Surface the exact numbers so the
+            // narration is accurate and a future re-attempt can use the
+            // available balance.
+            log.warn(
+              `submit_trade insufficient_token_balance: requested=${result.requested} available=${result.available}`,
+            );
+            stateStore.recordDecision({
+              ts: Date.now(),
+              symbol: input.tokenIn.slice(0, 8),
+              action: "PASS",
+              reason: `insufficient_token_balance: ${result.reason}`,
+            });
+            stateStore.recordTradeResult(
+              `insufficient_token_balance: ${result.reason}`,
+              { side, outcome: "insufficient_token_balance" },
+            );
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `execute-failed: insufficient_token_balance (requested=${result.requested}, available=${result.available})`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          case "failed_onchain": {
+            log.warn(
+              `submit_trade failed_onchain txid=${result.txid} err=${JSON.stringify(result.err)}`,
+            );
+            stateStore.recordDecision({
+              ts: Date.now(),
+              symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+              action: "PASS",
+              reason: `failed_onchain ${result.txid}: ${JSON.stringify(result.err)}`,
+            });
+            stateStore.recordTradeResult(`failed_onchain ${result.txid}`, {
+              side,
+              txid: result.txid,
+              outcome: "failed_onchain",
+            });
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `execute-failed: tx ${result.txid} failed on-chain (${JSON.stringify(result.err)})`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          case "not_landed": {
+            // Phase 10 (codex re-audit #5): pre-send-abort returns txid=null
+            // with reason="aborted before send"; post-send-timeout returns a
+            // real txid. The decision log + trade-result narrate both cases
+            // so a reviewer can tell from /phase-events whether the kill
+            // switch caught us in time or whether the tx is sitting
+            // somewhere on the wire.
+            const txLabel = result.txid ?? "<not-sent>";
+            const reasonLabel = result.reason
+              ? `${result.reason} (${txLabel})`
+              : `not_landed ${txLabel}`;
+            log.warn(`submit_trade not_landed txid=${txLabel} reason=${result.reason ?? "(post-send timeout)"}`);
+            stateStore.recordDecision({
+              ts: Date.now(),
+              symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+              action: "PASS",
+              reason: reasonLabel,
+            });
+            stateStore.recordTradeResult(reasonLabel, {
+              side,
+              // Only attach txid when we actually broadcast. A null txid
+              // here would otherwise pollute the phase_events row with a
+              // signature that doesn't exist on-chain.
+              ...(result.txid ? { txid: result.txid } : {}),
+              outcome: "not_landed",
+            });
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: result.txid
+                    ? `execute-failed: tx ${result.txid} did not land within timeout`
+                    : `execute-failed: ${result.reason ?? "aborted before send"} (no tx broadcast)`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          case "route_liquidity_denied": {
+            // Phase 12 (codex Phase 11 re-audit blocker #2b): the
+            // authoritative quote inside executeTrade — the one we'd actually
+            // pass to /swap — failed the route-liquidity gate. This is the
+            // structural deny: no route OR priceImpactPct above the 50% hard
+            // ceiling. No tx was signed and no lamports burned. The handler's
+            // own preview-quote gate above is best-effort and may use a
+            // slightly different /quote response (race window <100ms typical)
+            // — this catch is what guarantees we never submit a real-money
+            // /swap on a no-route quote, even if the preview happened to land
+            // in a healthy window.
+            log.warn(
+              `submit_trade route_liquidity_denied (post-quote): ${result.reason}`,
+            );
+            stateStore.recordDecision({
+              ts: Date.now(),
+              symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+              action: "PASS",
+              reason: `route-liquidity (post-quote): ${result.reason}`,
+            });
+            stateStore.recordTradeResult(
+              `route-liquidity (post-quote): ${result.reason}`,
+              { side, outcome: "denied_route_liquidity_post_quote" },
+            );
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `execute-failed: route-liquidity denied (post-quote): ${result.reason}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          default: {
+            // Phase 4: exhaustiveness — any new ExecuteTradeResult variant
+            // becomes a compile error here, so failure paths can't be
+            // silently added without updating the handler.
+            const _exhaustive: never = result;
+            throw new Error(
+              `unhandled ExecuteTradeResult variant: ${JSON.stringify(_exhaustive)}`,
+            );
+          }
+        }
       } catch (err) {
         log.error(`submit_trade execute failed: ${String(err)}`);
         stateStore.recordDecision({
           ts: Date.now(),
-          symbol: input.tokenOut.slice(0, 8),
+          symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
           action: "PASS",
           reason: `execute-failed: ${String(err)}`,
         });
-        stateStore.setPhase("WATCHING");
+        stateStore.recordTradeResult(`execute-failed: ${String(err)}`, {
+          side,
+          outcome: "execute_threw",
+        });
         return {
           content: [
             { type: "text", text: `execute-failed: ${String(err)}` },
@@ -212,45 +817,87 @@ export function createPepeMcpServer(
         };
       }
 
+      // landedLate paths annotate the trade row so a human can reconcile
+      // later — the tx did land, but confirmation arrived past our 90s
+      // window, so price + slippage might be staler than usual.
+      const recordReason = landedLate
+        ? `${input.reason} [landed-after-timeout: reconcile]`
+        : input.reason;
       try {
-        // Record into ledger. SOL->TOKEN is BUY; we open a position for the
-        // output token. The agent calls `mark_position` to close.
-        if (!ledger.hasTradeTxid(txid)) {
-          ledger.recordTrade({
-            tokenIn: input.tokenIn,
-            tokenOut: input.tokenOut,
-            side: "BUY",
-            amountSol: input.amountSol,
-            txid,
-            executedPriceSolPerToken,
-            reason: input.reason,
+        if (side === "BUY") {
+          if (!ledger.hasTradeTxid(txid)) {
+            ledger.recordTrade({
+              tokenIn: input.tokenIn,
+              tokenOut: input.tokenOut,
+              side: "BUY",
+              amountSol: input.amountSol as number,
+              txid,
+              executedPriceSolPerToken,
+              reason: recordReason,
+            });
+          }
+          ledger.openPosition({
+            tokenId: input.tokenOut,
+            entryPriceSolPerToken: executedPriceSolPerToken ?? 0,
+            sizeSol: input.amountSol as number,
+            decimals: mintDecimals as number,
+            // Phase 10 (#1): persist the exact uint64 received so the SELL
+            // path can size exits precisely, instead of inferring tokens =
+            // sizeSol / entryPrice (slippage-corrupted).
+            tokensReceivedAtomic,
           });
-        }
-        ledger.openPosition({
-          tokenId: input.tokenOut,
-          entryPriceSolPerToken: executedPriceSolPerToken ?? 0,
-          sizeSol: input.amountSol,
-        });
 
-        // Phase 5: record the decision in the state store for the dot-matrix
-        // log; symbol extraction is a stub - agent's reason text matters more.
-        stateStore.recordDecision({
-          ts: Date.now(),
-          symbol: input.tokenOut.slice(0, 8),
-          action: "BUY",
-          reason: input.reason,
-        });
-        stateStore.setSelectedToken(input.tokenOut);
+          stateStore.recordDecision({
+            ts: Date.now(),
+            symbol: input.tokenOut.slice(0, 8),
+            action: "BUY",
+            reason: recordReason,
+          });
+          stateStore.setSelectedToken(input.tokenOut);
+        } else {
+          // SELL: record trade row, then close the position. The position is
+          // keyed by mint (tokenId == tokenIn for SELL). On-chain
+          // confirmation succeeded above (status === "ok" or
+          // "landed_after_timeout").
+          if (!ledger.hasTradeTxid(txid)) {
+            ledger.recordTrade({
+              tokenIn: input.tokenIn,
+              tokenOut: input.tokenOut,
+              side: "SELL",
+              // amountSol on a SELL row records realized SOL proceeds; quote.outAmount
+              // is lamports for SELL.
+              amountSol: 0,
+              txid,
+              executedPriceSolPerToken,
+              reason: recordReason,
+            });
+          }
+          ledger.closePosition(input.tokenIn);
+
+          stateStore.recordDecision({
+            ts: Date.now(),
+            symbol: input.tokenIn.slice(0, 8),
+            action: "SELL",
+            reason: recordReason,
+          });
+          stateStore.setSelectedToken(null);
+        }
       } catch (err) {
         log.error(`post-trade bookkeeping failed after txid ${txid}: ${String(err)}`);
         try {
           stateStore.recordDecision({
             ts: Date.now(),
-            symbol: input.tokenOut.slice(0, 8),
-            action: "BUY",
+            symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+            action: side,
             reason: `executed ${txid}; bookkeeping failed, do not retry automatically`,
           });
-          stateStore.setSelectedToken(input.tokenOut);
+          if (side === "BUY") stateStore.setSelectedToken(input.tokenOut);
+          else stateStore.setSelectedToken(null);
+          stateStore.recordTradeResult(`bookkeeping-failed ${txid}`, {
+            side,
+            txid,
+            outcome: "bookkeeping_failed",
+          });
         } catch (stateErr) {
           log.error(`state recovery failed for executed txid ${txid}: ${String(stateErr)}`);
         }
@@ -264,20 +911,50 @@ export function createPepeMcpServer(
         };
       }
 
+      // Phase 14 (codex Phase 13 re-audit liveness fix P14-C2): clear the
+      // TRADING phase BEFORE the claude-mem call. Previously the order was
+      //   await memClient.recordObservation(...);   // could hang on mem outage
+      //   stateStore.recordTradeResult(...);        // never reached → TRADING
+      //                                             // phase stuck until 90s
+      //                                             // safety timeout
+      // If claude-mem hangs (network blip, daemon crash, anything), the
+      // recordTradeResult call must still fire so the state machine flips
+      // back to WATCHING promptly. Reordering preserves the "mem call
+      // happens" semantic without making it a blocking hop for state
+      // transitions.
+      //
+      // Phase 4: trade fully resolved (ok or landed_after_timeout). Clear
+      // TRADING phase via recordTradeResult so the state machine flips
+      // back to WATCHING (replaces the old TRADING_HOLD_MS auto-flip).
+      stateStore.recordTradeResult(`executed ${txid}`, {
+        side,
+        txid,
+        outcome: landedLate ? "landed_after_timeout" : "ok",
+      });
+
       // Record the decision in claude-mem so future sessions see it
-      // (plan Phase 4 step 5, line 388).
-      try {
-        await memClient.recordObservation({
+      // (plan Phase 4 step 5, line 388). Runs AFTER recordTradeResult per
+      // P14-C2 — mem can hang or fail without blocking phase clearance.
+      //
+      // Phase 15 (codex Phase 14 re-audit critical blocker): fire-and-forget.
+      // P14-C2 reordered so recordTradeResult fires first, but the handler
+      // still AWAITED recordObservation — meaning a hanging mem daemon would
+      // wedge the entire agent turn (the tool call never returns to the
+      // SDK, which means the LLM never gets a tool_result, which means the
+      // turn is stuck until the SDK's own timeout, if any). The mem write
+      // is best-effort telemetry, never on a correctness path; detach it.
+      void memClient
+        .recordObservation({
           contentSessionId,
           tool_name: "trade-executed",
-          tool_input: JSON.stringify(intent),
-          tool_response: JSON.stringify({ txid, executedPriceSolPerToken }),
+          tool_input: JSON.stringify({ ...intent, side, sellAmountTokens: input.sellAmountTokens }),
+          tool_response: JSON.stringify({ txid, executedPriceSolPerToken, side }),
           cwd: process.cwd(),
           platformSource: "pepe-agent-worker",
+        })
+        .catch((err) => {
+          log.warn(`claude-mem record failed (non-fatal): ${String(err)}`);
         });
-      } catch (err) {
-        log.warn(`claude-mem record failed (non-fatal): ${String(err)}`);
-      }
 
       return {
         content: [{ type: "text", text: `executed ${txid}` }],
@@ -319,11 +996,17 @@ export function createPepeMcpServer(
           isError: true,
         };
       }
+      // Manual entry path — we don't fetch decimals here. Use 0 (sentinel)
+      // so position-monitor's lazy-backfill (`!Number.isFinite || <= 0`)
+      // triggers on the first tick and writes the correct mint decimals via
+      // setPositionDecimals. A default of 9 (SOL) would silently bypass
+      // backfill and corrupt the unit math for any non-9-decimal token.
       ledger.openPosition({
         tokenId,
         symbol,
         entryPriceSolPerToken,
         sizeSol,
+        decimals: 0,
       });
       stateStore.setSelectedToken(tokenId);
       return { content: [{ type: "text", text: `opened ${tokenId} (${reason})` }] };
@@ -337,7 +1020,9 @@ export function createPepeMcpServer(
       reason: z.string().min(4),
     },
     async ({ reason }) => {
-      killSwitchRef.tripped = true;
+      // Phase 4: trip() also aborts the kill-switch AbortSignal so an in-
+      // flight signAndSend rebroadcast loop exits.
+      killSwitchRef.trip();
       log.warn(`kill switch tripped: ${reason}`);
       return {
         content: [
@@ -347,16 +1032,35 @@ export function createPepeMcpServer(
     }
   );
 
+  return {
+    getTopTokens,
+    getOpenPositions,
+    getQuote,
+    submitTrade,
+    markPosition,
+    killSwitch,
+  };
+}
+
+/**
+ * Production entry point — wraps the tool definitions from createPepeTools
+ * in an MCP SDK server config. Tests bypass this wrapper and use the raw
+ * tools directly.
+ */
+export function createPepeMcpServer(
+  args: CreatePepeMcpServerArgs,
+): McpSdkServerConfigWithInstance {
+  const tools = createPepeTools(args);
   return createSdkMcpServer({
     name: "pepe",
     version: "0.1.0",
     tools: [
-      getTopTokens,
-      getOpenPositions,
-      getQuote,
-      submitTrade,
-      markPosition,
-      killSwitch,
+      tools.getTopTokens,
+      tools.getOpenPositions,
+      tools.getQuote,
+      tools.submitTrade,
+      tools.markPosition,
+      tools.killSwitch,
     ],
   });
 }

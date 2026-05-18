@@ -19,11 +19,21 @@
  * concurrent /chat call awaits the prior turn's completion before injecting.
  */
 import type { AgentLoopHandle } from "../agent/loop.ts";
+import type { TurnIdleRef } from "../agent/auto-tick.ts";
 
 export interface ChatStreamArgs {
   agent: AgentLoopHandle;
   userText: string;
   signal?: AbortSignal;
+  /**
+   * Phase 11 (codex Phase 10 re-audit H2): shared turn-idle flag. /chat
+   * injections must flip this `false` BEFORE injecting so auto-tick's 15s
+   * push interval can't fire on top of an in-flight chat turn. `result`
+   * (turn fully ended) flips it back to `true`. Optional so unit tests
+   * that don't exercise auto-tick can omit it; production boot wires the
+   * same instance to both call sites.
+   */
+  turnIdleRef?: TurnIdleRef;
 }
 
 const encoder = new TextEncoder();
@@ -38,7 +48,7 @@ function encodeSseFrame(event: string, data: unknown): Uint8Array {
 let chatTurnLock: Promise<void> = Promise.resolve();
 
 export function createChatStream(args: ChatStreamArgs): ReadableStream<Uint8Array> {
-  const { agent, userText, signal } = args;
+  const { agent, userText, signal, turnIdleRef } = args;
 
   return new ReadableStream<Uint8Array>({
     start(controller) {
@@ -140,6 +150,17 @@ export function createChatStream(args: ChatStreamArgs): ReadableStream<Uint8Arra
         agent.emitter.on("result", onResult);
         agent.emitter.on("error", onError);
         if (signal) signal.addEventListener("abort", onAbort);
+
+        // Phase 11 (H2): flip the shared turn-idle flag BEFORE injecting.
+        // auto-tick's pushInterval checks this same ref and skips its push
+        // while we're mid-chat-turn. `result` (turn fully ended) flips it
+        // back to `true` — auto-tick wires that listener at startup so we
+        // don't have to re-wire it here. Without this flip, auto-tick's
+        // next 15s tick would stack a market_snapshot injection on top of
+        // the live chat turn.
+        if (turnIdleRef) {
+          turnIdleRef.current = false;
+        }
 
         // Inject *after* listeners are wired so we can't miss the first chunk.
         try {

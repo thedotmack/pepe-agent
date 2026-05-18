@@ -1,0 +1,19 @@
+[36m2026-05-18T11:41:16.765Z [info] [boot][0m pepe-agent worker starting {"network":"devnet","port":37011}
+[36m2026-05-18T11:41:16.771Z [info] [boot][0m trade ledger opened at /Users/alexnewman/.superset/projects/Pepe-Agent/.data/trades.db
+[33m2026-05-18T11:41:16.771Z [warn] [boot][0m no wallet configured — submit_trade will be denied (set AGENT_WALLET_PRIVATE_KEY_BASE58)
+[36m2026-05-18T11:41:16.771Z [info] [boot][0m claude-mem worker URL: http://127.0.0.1:37777
+[36m2026-05-18T11:41:16.783Z [info] [boot][0m claude-mem health ok
+[36m2026-05-18T11:41:16.859Z [info] [boot][0m session initialized pepe-agent-a8351c2d-a3c3-4541-9e96-b9b57ac0cb4b (project=Pepe-Agent)
+[36m2026-05-18T11:41:16.860Z [info] [activity][0m connecting wss://api.memedeck.win/activity
+[33m2026-05-18T11:41:16.867Z [warn] [boot][0m ANTHROPIC_API_KEY not set — agent loop disabled (subscribers + memory tick still run)
+[36m2026-05-18T11:41:16.874Z [info] [rpc][0m listening on http://127.0.0.1:37011 {"walletPubkey":null}
+[36m2026-05-18T11:41:16.874Z [info] [boot][0m worker ready
+[36m2026-05-18T11:41:17.173Z [info] [boot][0m activity status → live
+[36m2026-05-18T11:41:17.174Z [info] [activity][0m connected wss://api.memedeck.win/activity
+[36m2026-05-18T11:41:21.915Z [info] [memory][0m tick 1 → snapshot recorded (top: SOS, PUMP, TROLL, SPX, BULL)
+[36m2026-05-18T11:41:26.875Z [info] [memory][0m tick 2 → snapshot recorded (top: TROLL, BULL, WENGU, PIGEON, PTROLL)
+[36m2026-05-18T11:41:31.875Z [info] [memory][0m tick 3 → snapshot recorded (top: TROLL, BULL, PIGEON, PTROLL, WENGU)
+[36m2026-05-18T11:41:36.878Z [info] [memory][0m tick 4 → snapshot recorded (top: TRUMP, PIGEON, TSLAx, TROLL, PTROLL)
+[36m2026-05-18T11:41:41.876Z [info] [memory][0m tick 5 → snapshot recorded (top: PIGEON, TRUMP, TROLL, PTROLL, BULL)
+[33m2026-05-18T11:41:46.620Z [warn] [boot][0m received SIGTERM, shutting down
+[33m2026-05-18T11:41:46.620Z [warn] [activity][0m WS closed code=1000

@@ -55,6 +55,17 @@ export interface CreateAgentLoopArgs {
   memClient: ClaudeMemClient;
   contentSessionId: string;
   stateStore: StateStore;
+  /**
+   * Optional accessor for the live wallet SOL balance. Plumbed into the
+   * trade-policy context so all three policy gates (hook, canUseTool,
+   * handler) see the same TANK-EMPTY / UNKNOWN signal.
+   *
+   * Phase 6: returns `number | null`. `null` means "balance unknown" (e.g.
+   * RPC poll never succeeded). The policy treats UNKNOWN as deny-BUY but
+   * allow-SELL. When omitted, defaults to `() => null` so the BUY path is
+   * gated closed by default — never fail open. Audit finding #9.
+   */
+  getWalletSolBalance?: () => number | null;
 }
 
 export interface AgentLoopHandle {
@@ -86,7 +97,15 @@ function extractAssistantText(msg: SDKMessage): string | null {
 }
 
 export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { start: () => void } {
-  const { subscriber, killSwitchRef, ledger, memClient, contentSessionId, stateStore } = args;
+  const {
+    subscriber,
+    killSwitchRef,
+    ledger,
+    memClient,
+    contentSessionId,
+    stateStore,
+    getWalletSolBalance,
+  } = args;
 
   const outbound = new EventEmitter();
   outbound.setMaxListeners(50);
@@ -102,6 +121,10 @@ export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { 
     walletAvailable: walletAvailable(),
     now: () => Date.now(),
     killSwitchTripped: () => killSwitchRef.tripped,
+    // Phase 6: default to `() => null` (UNKNOWN) when no accessor is wired.
+    // The old `() => Infinity` default fails open — a BUY would silently
+    // skip the TANK_EMPTY gate. Audit finding #9.
+    walletSolBalance: getWalletSolBalance ?? (() => null),
   };
 
   const policyCheck = (intent: TradeIntent) =>

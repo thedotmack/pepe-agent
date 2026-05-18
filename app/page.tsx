@@ -22,7 +22,9 @@ type AgentStateSnapshot = {
   phase: AgentPhase;
   selectedTokenId: string | null;
   callingSinceMs: number | null;
-  walletSol: number;
+  // Phase 8 (O3): nullable — worker reports `null` when RPC down or no
+  // balance has been fetched yet. Board renders null as "--.-- SOL".
+  walletSol: number | null;
   pnlUsd: number;
   openPositions: number;
   killSwitch: boolean;

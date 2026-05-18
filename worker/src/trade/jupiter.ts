@@ -16,10 +16,89 @@
  */
 import {
   Connection,
+  PublicKey,
   VersionedTransaction,
+  type SignatureStatus,
 } from "@solana/web3.js";
+// spl-token signatures sourced from @solana/spl-token@0.4 d.ts (no skill present).
+import {
+  getAccount,
+  getAssociatedTokenAddressSync,
+  TokenAccountNotFoundError,
+} from "@solana/spl-token";
+// Phase 14 (codex Phase 13 re-audit liveness fix P14-C1): on
+// sendRawTransaction timeout we derive the canonical txid client-side from
+// tx.signatures[0] so the rebroadcast/confirm loop can still race to land
+// the trade. bs58 is already a worker dep (wallet.ts decodes secrets with
+// it) — same encoding the network uses.
+import bs58 from "bs58";
 import { config } from "../config.ts";
+import { createLogger } from "../logger.ts";
 import { getKeypair, getPublicKey } from "./wallet.ts";
+// Phase 12 (codex Phase 11 re-audit blocker #2b): the authoritative quote
+// fetched inside executeTrade was never route-checked before submitSwap. The
+// handler's preview-quote gate was best-effort; this is the structural one.
+// Same module as the preview gate so policy stays single-source-of-truth.
+import { checkRouteLiquidity } from "./policy.ts";
+// Phase 13 (codex Phase 12 re-audit blocker) + Phase 14 (codex Phase 13
+// re-audit liveness fix P14-C1): bound EVERY RPC await in this module with
+// the same 10s ceiling as position-monitor's backfill and tools/index.ts's
+// pre/post-BUY reads. spl-token and web3.js have no overall-await timeout
+// at all — a hung RPC would otherwise wedge:
+//   - the SELL preflight (getAccount) after policy approval, before we
+//     know whether the ATA holds enough (Phase 13);
+//   - the initial sendRawTransaction (Phase 14 — soft-failure: the
+//     rebroadcast loop is already bounded by CONFIRM_TIMEOUT_MS so a
+//     timeout here just falls through to that race);
+//   - the two getSignatureStatus polls (Phase 14 — null-result fallback:
+//     timeout is treated as "no status" so the existing not_landed /
+//     landed_after_timeout logic still drives the outcome).
+// Local re-implementation (rather than `import { withRpcTimeout } from
+// "../agent/position-monitor.ts"`) avoids the circular import —
+// position-monitor.ts already imports defaultRpcUrl + getQuote from this
+// module. Renamed from withSellPreflightTimeout to withSolanaTimeout
+// because Phase 14 reuses it across all RPC sites here, not just the SELL
+// preflight. Same constant + primitive (AbortSignal.timeout) as the
+// position-monitor helper so an operator only learns one number.
+const SOLANA_RPC_TIMEOUT_MS = 10_000;
+function withSolanaTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+  return Promise.race([
+    operation,
+    new Promise<T>((_, reject) => {
+      const signal = AbortSignal.timeout(SOLANA_RPC_TIMEOUT_MS);
+      signal.addEventListener(
+        "abort",
+        () =>
+          reject(
+            new Error(`${label} timeout after ${SOLANA_RPC_TIMEOUT_MS}ms`),
+          ),
+        { once: true },
+      );
+    }),
+  ]);
+}
+
+const log = createLogger("trade.jupiter");
+
+/** How long to race confirmTransaction before giving up and polling status.
+ *  Exported (Phase 7 H2) so state.ts can reuse the same constant for the
+ *  TRADING safety timeout, and so jupiter-confirm.test.ts can drive timing
+ *  off the canonical value instead of a hard-coded wall-clock sleep. */
+export const CONFIRM_TIMEOUT_MS = 90_000;
+/** Interval between rebroadcasts of the signed tx while waiting for confirm.
+ *  Exported for the same reason as CONFIRM_TIMEOUT_MS. */
+export const REBROADCAST_INTERVAL_MS = 2_000;
+/**
+ * Hard ceiling for any single HTTP request to Jupiter. Bare `fetch()` has no
+ * default timeout; a hung connection (DNS stall, half-open TCP, GFW-style
+ * blackhole) would otherwise wedge the position monitor's setInterval body
+ * and every downstream caller. 10s is long enough for Jupiter on a bad day
+ * and short enough that a TP/SL signal can still fire on the next tick if
+ * one quote stalls. Phase 10 (codex re-audit #7).
+ */
+export const JUP_FETCH_TIMEOUT_MS = 10_000;
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 const JUP_BASE = "https://lite-api.jup.ag/swap/v1";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -42,7 +121,7 @@ function resolveMint(mint: string): string {
   return mint === "SOL" ? SOL_MINT : mint;
 }
 
-function defaultRpcUrl(): string {
+export function defaultRpcUrl(): string {
   if (config.SOLANA_RPC_URL) return config.SOLANA_RPC_URL;
   if (config.SOLANA_NETWORK === "devnet") return "https://api.devnet.solana.com";
   if (config.SOLANA_NETWORK === "testnet") return "https://api.testnet.solana.com";
@@ -66,7 +145,11 @@ export async function getQuote(args: {
     slippageBps: String(args.slippageBps),
   });
   const url = `${JUP_BASE}/quote?${params.toString()}`;
-  const res = await fetch(url);
+  // Phase 10 (codex re-audit #7): bare fetch has no default timeout, so a
+  // hung Jupiter connection would block position-monitor's poll loop forever.
+  // AbortSignal.timeout rejects the request with TimeoutError after the
+  // ceiling — bounded latency at the cost of one extra error path.
+  const res = await fetch(url, { signal: AbortSignal.timeout(JUP_FETCH_TIMEOUT_MS) });
   if (!res.ok) {
     const text = await res.text().catch(() => "<no-body>");
     throw new Error(`Jupiter quote ${res.status}: ${text}`);
@@ -74,11 +157,24 @@ export async function getQuote(args: {
   return (await res.json()) as QuoteResponse;
 }
 
+export interface SubmitSwapResult {
+  swapTransaction: string;
+  /** Block height at which the tx Jupiter signed becomes invalid. Used as
+   * the expiry signal for the post-send confirmation loop — DO NOT replace
+   * with a fresh getLatestBlockhash() call. */
+  lastValidBlockHeight: number;
+  /** Telemetry only — Jupiter's selected priority fee in lamports. */
+  prioritizationFeeLamports?: number;
+}
+
 export async function submitSwap(args: {
   quote: QuoteResponse;
   userPublicKey: string;
-}): Promise<{ swapTransaction: string }> {
+}): Promise<SubmitSwapResult> {
   const url = `${JUP_BASE}/swap`;
+  // Phase 10 (codex re-audit #7): see getQuote — same timeout pattern.
+  // /swap is more expensive than /quote (signs a tx server-side) so this
+  // hangs are more probable; the ceiling is the same.
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -87,98 +183,564 @@ export async function submitSwap(args: {
       userPublicKey: args.userPublicKey,
       wrapAndUnwrapSol: true,
     }),
+    signal: AbortSignal.timeout(JUP_FETCH_TIMEOUT_MS),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "<no-body>");
     throw new Error(`Jupiter swap ${res.status}: ${text}`);
   }
-  const json = (await res.json()) as { swapTransaction?: string };
+  const json = (await res.json()) as {
+    swapTransaction?: string;
+    lastValidBlockHeight?: number;
+    prioritizationFeeLamports?: number;
+  };
   if (!json.swapTransaction) {
     throw new Error("Jupiter swap response missing swapTransaction");
   }
-  return { swapTransaction: json.swapTransaction };
+  if (typeof json.lastValidBlockHeight !== "number") {
+    throw new Error("Jupiter swap response missing lastValidBlockHeight");
+  }
+  return {
+    swapTransaction: json.swapTransaction,
+    lastValidBlockHeight: json.lastValidBlockHeight,
+    prioritizationFeeLamports: json.prioritizationFeeLamports,
+  };
 }
 
+/** Outcome of a sign-and-send attempt, after the rebroadcast/confirm dance.
+ *  Phase 10: `not_landed` now carries `txid: string | null` to express the
+ *  pre-send abort case where we never broadcast — no txid exists in that
+ *  branch. The post-send/confirm-failed branches still carry a real txid. */
+export type SignAndSendResult =
+  | { status: "ok"; txid: string }
+  | { status: "failed_onchain"; txid: string; err: unknown }
+  | { status: "not_landed"; txid: string | null; reason?: string }
+  | { status: "landed_after_timeout"; txid: string; value: SignatureStatus };
+
+// citation: pattern adapted from Jupiter station-app reference
+// `transactionSender.ts` — confirm against the blockhash that was signed
+// into the tx (recoverable from tx.message.recentBlockhash), and use
+// `lastValidBlockHeight` from the /swap response. Rebroadcast in a loop
+// instead of relying on RPC maxRetries.
 export async function signAndSend(
   swapTransactionBase64: string,
-  connection: Connection
-): Promise<{ txid: string }> {
+  connection: Connection,
+  lastValidBlockHeight: number,
+  externalSignal?: AbortSignal,
+): Promise<SignAndSendResult> {
   const keypair = getKeypair();
   const buf = Buffer.from(swapTransactionBase64, "base64");
   const tx = VersionedTransaction.deserialize(buf);
   tx.sign([keypair]);
   const raw = tx.serialize();
-  const txid = await connection.sendRawTransaction(raw, {
-    skipPreflight: false,
-    maxRetries: 0,
-  });
-  // confirmTransaction on web3.js@1 accepts either a sig string (deprecated)
-  // or a `BlockheightBasedTransactionConfirmationStrategy`. Fetch a fresh
-  // blockhash for the strategy form so we don't get the deprecated-overload
-  // type error.
-  const latest = await connection.getLatestBlockhash("confirmed");
-  await connection.confirmTransaction(
+  // The blockhash the tx was signed against — required by the confirmation
+  // strategy. NEVER fetch a fresh one here, that defeats the expiry mechanism.
+  const blockhash = tx.message.recentBlockhash;
+
+  // Phase 4: an external abort (kill switch tripped mid-trade) must short-
+  // circuit the rebroadcast/confirm loop. Compose the external signal into
+  // the internal AbortController BEFORE send so a pre-aborted external
+  // signal still aborts the internal one.
+  // citation: AbortSignal composition pattern — listen on the external
+  // signal and forward .abort() to the internal controller, { once: true }
+  // so we don't leak listeners if the loop ends first.
+  const abortController = new AbortController();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      abortController.abort();
+    } else {
+      externalSignal.addEventListener(
+        "abort",
+        () => abortController.abort(),
+        { once: true },
+      );
+    }
+  }
+
+  // Phase 10 (codex re-audit #5): an already-aborted externalSignal must
+  // short-circuit BEFORE we broadcast. Without this guard, a /kill that
+  // tripped between policy approval and signAndSend entry would still leak
+  // one final tx onto the network. The previous post-send check at the
+  // bottom of the function caught the abort but only AFTER the tx was on
+  // the wire. txid=null on this path because we deliberately never sent.
+  if (abortController.signal.aborted) {
+    log.warn(
+      "signAndSend aborted via externalSignal BEFORE initial sendRawTransaction (pre-send guard)",
+    );
+    return { status: "not_landed", txid: null, reason: "aborted before send" };
+  }
+
+  // Phase 14 (codex Phase 13 re-audit liveness fix P14-C1): bound the initial
+  // sendRawTransaction with the same 10s ceiling as every other RPC site in
+  // this module. web3.js's sendRawTransaction has no overall-await timeout,
+  // so a hung RPC here would wedge signAndSend BEFORE we ever enter the
+  // confirm/rebroadcast dance — TRADING phase would stay set until state.ts's
+  // 90s safety timeout, and no rebroadcast would fire.
+  // Soft-failure semantics: a sendRawTransaction timeout falls through to
+  // the rebroadcast loop (bounded by CONFIRM_TIMEOUT_MS via its race with
+  // the timeout promise below). The rebroadcast loop keeps retrying the
+  // send while we wait for confirmation, so an initial-send timeout doesn't
+  // necessarily mean the trade is lost — it just means we got no signature
+  // back from the first attempt and rely on the rebroadcast/confirm path
+  // to either land it or declare not_landed.
+  // We need a txid to drive the confirm/poll calls below, so on timeout we
+  // derive it client-side from tx.signatures[0]: VersionedTransaction signs
+  // in place, so signatures[0] is canonical and matches what the network
+  // sees when the rebroadcast eventually lands. bs58-encoded for parity
+  // with the string getSignatureStatus expects.
+  let txid: string;
+  try {
+    txid = await withSolanaTimeout(
+      connection.sendRawTransaction(raw, {
+        skipPreflight: true,
+        maxRetries: 0,
+      }),
+      "signAndSend sendRawTransaction (initial)",
+    );
+  } catch (err) {
+    if (err instanceof Error && /timeout after \d+ms/.test(err.message)) {
+      // Soft failure: derive the txid client-side from the signed tx's
+      // first signature so the rebroadcast/confirm loop can still race to
+      // land it. Once the rebroadcast loop succeeds the network sees this
+      // same signature.
+      const sig = tx.signatures[0];
+      txid = bs58.encode(sig);
+      log.warn(
+        `signAndSend initial sendRawTransaction timed out; derived txid=${txid} from signed tx; ` +
+          `rebroadcast loop will continue (CONFIRM_TIMEOUT_MS bounds the dance)`,
+      );
+    } else {
+      throw err;
+    }
+  }
+
+  // If the external signal aborted between send and confirm setup, bail
+  // immediately — caller treats not_landed as "we don't know, kill conservatively".
+  if (abortController.signal.aborted) {
+    return { status: "not_landed", txid };
+  }
+
+  const confirmPromise = connection.confirmTransaction(
     {
       signature: txid,
-      blockhash: latest.blockhash,
-      lastValidBlockHeight: latest.lastValidBlockHeight,
+      blockhash,
+      lastValidBlockHeight,
+      abortSignal: abortController.signal,
     },
-    "confirmed"
+    "confirmed",
   );
-  return { txid };
+
+  // Background rebroadcast loop — keeps the tx in the leader's mempool while
+  // we wait for confirmation. Errors are swallowed; confirmation drives the
+  // outcome. Returns when the abort signal fires.
+  const rebroadcastPromise = (async () => {
+    while (!abortController.signal.aborted) {
+      await sleep(REBROADCAST_INTERVAL_MS);
+      if (abortController.signal.aborted) return;
+      try {
+        await connection.sendRawTransaction(raw, {
+          skipPreflight: true,
+          maxRetries: 0,
+        });
+      } catch {
+        // swallow — confirmation drives outcome
+      }
+    }
+  })();
+
+  // Race confirm against a hard timeout so a stuck blockhash-expiry RPC
+  // never wedges the agent. The timeout case falls through to a final
+  // getSignatureStatus poll.
+  const TIMEOUT_SENTINEL = Symbol("confirm-timeout");
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<typeof TIMEOUT_SENTINEL>((resolve) => {
+    timeoutHandle = setTimeout(() => resolve(TIMEOUT_SENTINEL), CONFIRM_TIMEOUT_MS);
+  });
+
+  let confirmOutcome:
+    | { kind: "resolved"; value: Awaited<typeof confirmPromise> }
+    | { kind: "rejected"; err: unknown }
+    | { kind: "timeout" };
+  try {
+    const winner = await Promise.race([
+      confirmPromise.then(
+        (value) => ({ kind: "resolved" as const, value }),
+        (err) => ({ kind: "rejected" as const, err }),
+      ),
+      timeoutPromise,
+    ]);
+    confirmOutcome =
+      winner === TIMEOUT_SENTINEL ? { kind: "timeout" } : winner;
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    abortController.abort();
+    // Surface unexpected errors from the rebroadcast loop but don't block.
+    rebroadcastPromise.catch((err) => {
+      log.warn(`rebroadcast loop errored: ${String(err)}`);
+    });
+  }
+
+  // External abort (kill switch mid-trade): we don't know whether the tx
+  // landed. Conservative answer is "not_landed" — caller treats as failure
+  // and reports execute-failed; if the tx did land, ledger reconciliation
+  // catches it later.
+  if (externalSignal?.aborted) {
+    log.warn(`tx ${txid} signAndSend aborted via externalSignal (kill switch?)`);
+    return { status: "not_landed", txid };
+  }
+
+  if (confirmOutcome.kind === "resolved") {
+    const value = confirmOutcome.value?.value;
+    if (value?.err) {
+      log.warn(`tx ${txid} failed on-chain: ${JSON.stringify(value.err)}`);
+      return { status: "failed_onchain", txid, err: value.err };
+    }
+    // Sanity reconciliation — confirmTransaction said success, double-check
+    // via getSignatureStatus. A null status here is surprising but not
+    // fatal; log and accept the confirm verdict.
+    // Phase 14 (codex Phase 13 re-audit liveness fix P14-C1): wrap with the
+    // 10s ceiling. A hung reconciliation RPC must not block the function's
+    // return — the confirm verdict already says "ok" so a timeout here just
+    // means we couldn't double-check; treat as null (logged, accept the
+    // confirm verdict).
+    try {
+      const status = await withSolanaTimeout(
+        connection.getSignatureStatus(txid, {
+          searchTransactionHistory: true,
+        }),
+        `signAndSend getSignatureStatus (post-confirm reconcile) for ${txid}`,
+      );
+      if (!status.value || !status.value.confirmationStatus) {
+        log.warn(
+          `tx ${txid} confirmed but getSignatureStatus returned ${JSON.stringify(status.value)}`,
+        );
+      }
+    } catch (err) {
+      log.warn(`getSignatureStatus reconciliation failed for ${txid}: ${String(err)}`);
+    }
+    return { status: "ok", txid };
+  }
+
+  // Either confirmTransaction rejected (commonly BlockheightExceededError)
+  // or our hard timeout fired. In both cases we poll on-chain reality once
+  // more before declaring the trade lost.
+  if (confirmOutcome.kind === "rejected") {
+    log.warn(
+      `confirmTransaction rejected for ${txid}: ${String(confirmOutcome.err)}; polling status`,
+    );
+  } else {
+    log.warn(`confirmTransaction timeout for ${txid} after ${CONFIRM_TIMEOUT_MS}ms; polling status`);
+  }
+  // Phase 14 (codex Phase 13 re-audit liveness fix P14-C1): wrap the final
+  // getSignatureStatus poll with the 10s ceiling. A hung RPC here would
+  // wedge signAndSend indefinitely AFTER the confirm/timeout race already
+  // resolved — the worst kind of hang, since the rebroadcast loop has been
+  // aborted and there's nothing else racing. Treat a timeout as null status
+  // (i.e., not_landed), which is identical to the existing "value === null"
+  // branch below.
+  let finalStatus: Awaited<ReturnType<Connection["getSignatureStatus"]>>;
+  try {
+    finalStatus = await withSolanaTimeout(
+      connection.getSignatureStatus(txid, {
+        searchTransactionHistory: true,
+      }),
+      `signAndSend getSignatureStatus (timeout-fallback poll) for ${txid}`,
+    );
+  } catch (err) {
+    log.error(`getSignatureStatus poll failed for ${txid}: ${String(err)}`);
+    return { status: "not_landed", txid };
+  }
+  const value = finalStatus.value;
+  if (!value) {
+    return { status: "not_landed", txid };
+  }
+  if (value.err) {
+    return { status: "failed_onchain", txid, err: value.err };
+  }
+  // Landed late — caller decides whether to record. Keep the full
+  // SignatureStatus on the result so downstream can read confirmationStatus.
+  return { status: "landed_after_timeout", txid, value };
 }
+
+export type ExecuteTradeArgs = {
+  inputMint: string;
+  outputMint: string;
+  slippageBps: number;
+  /** SOL→TOKEN: amount of SOL to spend (UI units). Mutually exclusive with sellAmountAtomic. */
+  amountSol?: number;
+  /** TOKEN→SOL: amount of input token to sell, in raw atomic units. Mutually exclusive with amountSol. */
+  sellAmountAtomic?: bigint;
+  /** Decimals of the non-SOL token in the pair. Required so executedPriceSolPerToken
+   *  is reported in SOL-per-UI-token (matching position-monitor's price units). */
+  decimals: number;
+  /** Phase 4: external abort signal (e.g. wired to killSwitchRef). When this
+   *  aborts mid-trade the rebroadcast/confirm loop exits and signAndSend
+   *  returns `not_landed`. Treats kill-mid-trade as conservative failure. */
+  externalSignal?: AbortSignal;
+};
+
+export type ExecuteTradeResult =
+  | {
+      status: "ok";
+      txid: string;
+      executedPriceSolPerToken: number | null;
+      quote: QuoteResponse;
+    }
+  | {
+      status: "no_token_account";
+      reason: string;
+    }
+  | {
+      // Phase 7 H1: distinguished from no_token_account so the handler /
+      // logs / agent prompt can correctly describe the failure (ATA exists
+      // but holds < requested). Carries the exact bigints so a future agent
+      // turn can re-attempt with the available balance instead of guessing.
+      status: "insufficient_token_balance";
+      requested: bigint;
+      available: bigint;
+      reason: string;
+    }
+  | {
+      status: "failed_onchain";
+      txid: string;
+      err: unknown;
+    }
+  | {
+      status: "not_landed";
+      // Phase 10: pre-send abort path carries null — we never broadcast,
+      // so no signature exists. Post-send timeouts still carry the real txid.
+      txid: string | null;
+      reason?: string;
+    }
+  | {
+      status: "landed_after_timeout";
+      txid: string;
+      value: SignatureStatus;
+      executedPriceSolPerToken: number | null;
+      quote: QuoteResponse;
+    }
+  | {
+      // Phase 12 (codex Phase 11 re-audit blocker #2b): the AUTHORITATIVE
+      // quote — the one we'd actually pass to /swap — failed the route-
+      // liquidity gate. The handler's preview-quote gate at submit_trade
+      // entry is best-effort and may use a different /quote response (race
+      // window <100ms typical). This is the structural deny at the trade
+      // boundary: no route OR priceImpactPct above the 50% hard ceiling.
+      // Returned BEFORE submitSwap so no tx is signed, no lamports burned.
+      status: "route_liquidity_denied";
+      reason: string;
+      quote: QuoteResponse;
+    };
 
 /**
  * High-level orchestrator: quote → swap → sign → send → confirm.
  * Used by the `submit_trade` tool handler.
  *
- * `executedPriceSolPerToken` is the SOL-side ratio if the trade is
- * SOL→TOKEN; otherwise null. We do NOT fetch token decimals here — Phase 4
- * verification doesn't need it.
+ * Supports both BUY (SOL→TOKEN) and SELL (TOKEN→SOL). For SELL the caller
+ * passes `sellAmountAtomic` (raw atomic uint64 of the input token); we verify
+ * the on-chain ATA exists and holds enough before quoting. Jupiter's
+ * `wrapAndUnwrapSol: true` automatically unwraps WSOL output back to native
+ * SOL — we do not create a close-account instruction ourselves.
+ *
+ * `executedPriceSolPerToken` is reported as SOL-per-UI-token (Phase 3): the
+ * caller passes the non-SOL mint's decimals so we can divide atomic amounts
+ * down to full-token units before computing the price ratio. This matches
+ * the units used by position-monitor's `entryPriceSolPerToken` so PnL math
+ * is consistent across the ledger.
  */
-export async function executeTrade(args: {
-  inputMint: string;
-  outputMint: string;
-  amountSol: number;
-  slippageBps: number;
-}): Promise<{ txid: string; executedPriceSolPerToken: number | null; quote: QuoteResponse }> {
+export async function executeTrade(
+  args: ExecuteTradeArgs,
+): Promise<ExecuteTradeResult> {
   const inputMint = resolveMint(args.inputMint);
   const outputMint = resolveMint(args.outputMint);
+  const isSell = inputMint !== SOL_MINT && outputMint === SOL_MINT;
+  const isBuy = inputMint === SOL_MINT && outputMint !== SOL_MINT;
 
-  // Convert SOL → lamports if buying with SOL. For SELL paths the caller is
-  // expected to pass an already-atomic amount via a different code path —
-  // Phase 4 only wires the BUY happy path. SELL gets wired in Phase 5.
-  if (inputMint !== SOL_MINT) {
+  if (!isSell && !isBuy) {
     throw new Error(
-      "executeTrade currently only supports SOL→TOKEN; SELL path lands in Phase 5"
+      `executeTrade only supports SOL↔TOKEN; got inputMint=${inputMint} outputMint=${outputMint}`,
     );
   }
-  const amountLamports = BigInt(Math.round(args.amountSol * 1e9)).toString();
+
+  let amountAtomic: string;
+  if (isBuy) {
+    if (args.amountSol === undefined) {
+      throw new Error("BUY (SOL→TOKEN) requires amountSol");
+    }
+    if (args.sellAmountAtomic !== undefined) {
+      throw new Error("BUY rejects sellAmountAtomic; pass amountSol only");
+    }
+    amountAtomic = BigInt(Math.round(args.amountSol * 1e9)).toString();
+  } else {
+    // isSell
+    if (args.sellAmountAtomic === undefined) {
+      throw new Error("SELL (TOKEN→SOL) requires sellAmountAtomic");
+    }
+    if (args.amountSol !== undefined) {
+      throw new Error("SELL rejects amountSol; pass sellAmountAtomic only");
+    }
+    if (args.sellAmountAtomic <= 0n) {
+      throw new Error("sellAmountAtomic must be > 0");
+    }
+    amountAtomic = args.sellAmountAtomic.toString();
+  }
 
   const rpcUrl = defaultRpcUrl();
   const connection = new Connection(rpcUrl, "confirmed");
   const userPublicKey = getPublicKey();
 
+  if (isSell) {
+    const ownerPk = new PublicKey(userPublicKey);
+    const mintPk = new PublicKey(inputMint);
+    const ata = getAssociatedTokenAddressSync(mintPk, ownerPk);
+    try {
+      // Phase 13 (codex Phase 12 re-audit blocker): bound the SELL preflight
+      // getAccount with a 10s timeout. spl-token has no overall-await
+      // timeout — a hung RPC would otherwise wedge the SELL path AFTER
+      // policy approval but BEFORE we know whether the ATA holds enough.
+      // On timeout: reuse the existing no_token_account variant (minimizes
+      // variant churn; the handler already treats it as a retryable
+      // failure). The reason string distinguishes "timeout" from "missing"
+      // for log/audit purposes.
+      const acct = await withSolanaTimeout(
+        getAccount(connection, ata),
+        `SELL preflight getAccount(${inputMint})`,
+      );
+      if (acct.amount < args.sellAmountAtomic!) {
+        // Phase 7 H1: ATA exists but doesn't hold enough — this is distinct
+        // from a missing ATA. Distinguishing the two lets the handler
+        // narrate "you don't have X tokens" vs "we never opened a position
+        // here", and lets a future agent prompt re-attempt with the
+        // available amount.
+        return {
+          status: "insufficient_token_balance",
+          requested: args.sellAmountAtomic!,
+          available: acct.amount,
+          reason: `ATA holds ${acct.amount.toString()} < requested ${args.sellAmountAtomic!.toString()}`,
+        };
+      }
+    } catch (err) {
+      // Token-2022 mints would throw TokenInvalidAccountOwnerError here — flag
+      // up to caller rather than silently retry with wrong program id.
+      if (err instanceof TokenAccountNotFoundError) {
+        return {
+          status: "no_token_account",
+          reason: `no ATA for mint ${inputMint} under owner ${userPublicKey}`,
+        };
+      }
+      // Phase 13: timeout falls through to here. Reuse no_token_account
+      // (rather than adding a preflight_timeout variant) — the handler
+      // already treats it as a retryable failure, so the agent will try
+      // again on its next turn once RPC recovers. Reason string includes
+      // "timeout" so /phase-events distinguishes this from a genuinely
+      // missing ATA for postmortem analysis.
+      if (err instanceof Error && /timeout after \d+ms/.test(err.message)) {
+        log.warn(
+          `SELL preflight getAccount timed out for mint ${inputMint}: ${err.message}`,
+        );
+        return {
+          status: "no_token_account",
+          reason: `SELL preflight getAccount timeout for mint ${inputMint}: ${err.message}`,
+        };
+      }
+      throw err;
+    }
+  }
+
   const quote = await getQuote({
     inputMint,
     outputMint,
-    amount: amountLamports,
+    amount: amountAtomic,
     slippageBps: args.slippageBps,
   });
 
-  const { swapTransaction } = await submitSwap({ quote, userPublicKey });
-  const { txid } = await signAndSend(swapTransaction, connection);
+  // Phase 12 (codex Phase 11 re-audit blocker #2b): structural route-
+  // liquidity gate on the AUTHORITATIVE quote — the one we're about to send
+  // to /swap. The handler's preview-quote gate at submit_trade entry is
+  // best-effort (a fresh /quote here may differ slightly) and previously
+  // FAILED OPEN when Jupiter blipped. This is the deny that matters: no
+  // route OR priceImpactPct above the 50% hard ceiling. Same gate function
+  // as the preview so policy stays single-source-of-truth. Returned before
+  // submitSwap so no tx is signed and no lamports are burned.
+  const liquidity = checkRouteLiquidity(quote);
+  if (!liquidity.allow) {
+    log.warn(
+      `executeTrade route-liquidity denied: ${liquidity.reason} for ${inputMint}→${outputMint}`,
+    );
+    return {
+      status: "route_liquidity_denied",
+      reason: liquidity.reason,
+      quote,
+    };
+  }
 
-  // SOL/token ratio — we know inAmount is in lamports (1e9 / SOL).
-  // outAmount is in atomic units of the output token (decimals unknown).
-  // The "SOL-side" ratio = SOL / atomic-token. Useful only for relative
-  // comparison across same-token trades. Null if we can't parse.
-  const inLamports = Number(quote.inAmount);
-  const outAtomic = Number(quote.outAmount);
-  const executedPriceSolPerToken =
-    Number.isFinite(inLamports) && Number.isFinite(outAtomic) && outAtomic > 0
-      ? inLamports / 1e9 / outAtomic
-      : null;
+  const { swapTransaction, lastValidBlockHeight } = await submitSwap({
+    quote,
+    userPublicKey,
+  });
+  const sendResult = await signAndSend(
+    swapTransaction,
+    connection,
+    lastValidBlockHeight,
+    args.externalSignal,
+  );
 
-  return { txid, executedPriceSolPerToken, quote };
+  // SOL per UI-token (Phase 3): divide lamports → SOL (÷ 1e9) and divide
+  // atomic-token amounts → UI tokens (÷ 10^decimals) before taking the ratio.
+  // This matches position-monitor's `entryPriceSolPerToken` units so PnL
+  // math is unit-consistent across the ledger.
+  //   BUY:  inAmount = lamports spent,    outAmount = atomic tokens received
+  //   SELL: inAmount = atomic tokens sold, outAmount = lamports received
+  //
+  // Phase 7 H6: `10 ** args.decimals` uses JS Number, which is safe up to
+  // Number.MAX_SAFE_INTEGER = 2^53 - 1 ≈ 9.007e15. That comfortably fits
+  // every real-world Solana mint: SPL token-program-v1 stores decimals in
+  // a u8 but in practice no mainnet token exceeds decimals=9 (SOL itself).
+  // Token-2022 also caps decimals at u8 but again real mints stay ≤ 9.
+  // For hypothetical decimals=15 the math is still exact; decimals=16
+  // would lose precision (1e16 = 10_000_000_000_000_000 > 2^53). If we
+  // ever ingest a token with decimals ≥ 16, fall back to BigInt math
+  // here. Tests in jupiter-sell.test.ts pin the precision boundary.
+  const inAmt = Number(quote.inAmount);
+  const outAmt = Number(quote.outAmount);
+  const tokenAtomicPerUi = 10 ** args.decimals;
+  let executedPriceSolPerToken: number | null = null;
+  if (Number.isFinite(inAmt) && Number.isFinite(outAmt) && inAmt > 0 && outAmt > 0) {
+    executedPriceSolPerToken = isBuy
+      ? (inAmt / 1e9) / (outAmt / tokenAtomicPerUi)
+      : (outAmt / 1e9) / (inAmt / tokenAtomicPerUi);
+  }
+
+  switch (sendResult.status) {
+    case "ok":
+      return {
+        status: "ok",
+        txid: sendResult.txid,
+        executedPriceSolPerToken,
+        quote,
+      };
+    case "failed_onchain":
+      return {
+        status: "failed_onchain",
+        txid: sendResult.txid,
+        err: sendResult.err,
+      };
+    case "not_landed":
+      // Phase 10: pre-send-abort vs post-send-timeout look the same to the
+      // caller (both "we don't know"); preserve the optional reason string
+      // so logs distinguish the two.
+      return {
+        status: "not_landed",
+        txid: sendResult.txid,
+        reason: sendResult.reason,
+      };
+    case "landed_after_timeout":
+      return {
+        status: "landed_after_timeout",
+        txid: sendResult.txid,
+        value: sendResult.value,
+        executedPriceSolPerToken,
+        quote,
+      };
+  }
 }

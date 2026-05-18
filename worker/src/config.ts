@@ -16,7 +16,13 @@ const optPubkey = z.preprocess(blankToUndef, z.string().min(32).optional());
 const optPort = z.preprocess(blankToUndef, z.coerce.number().int().positive().optional());
 
 const BootSchema = z.object({
-  AGENT_SHARED_SECRET: z.string().min(8, "AGENT_SHARED_SECRET must be set (>=8 chars)"),
+  // Phase 6 / audit finding #10: bumped from min(8) to min(32). 8 chars of
+  // entropy is brute-forceable for an HMAC-shared secret guarding a trading
+  // surface. 32 chars is the canonical floor for shared-secret authn (e.g.
+  // `openssl rand -hex 32`). Test fixtures already use 32+ char secrets.
+  AGENT_SHARED_SECRET: z
+    .string()
+    .min(32, "AGENT_SHARED_SECRET must be >=32 chars"),
   AGENT_WALLET_PUBLIC_KEY: optPubkey,
   WORKER_PORT: z.coerce.number().int().positive().default(7011),
   WORKER_BIND: z.string().default("127.0.0.1"),
