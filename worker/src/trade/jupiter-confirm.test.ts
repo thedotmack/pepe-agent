@@ -37,10 +37,13 @@ mock.module("./wallet.ts", () => {
 });
 
 // Buy path doesn't need spl-token; stub it to keep the import graph happy.
+// getMint is included so position-monitor-math.test.ts (which runs in the
+// same `bun test` invocation) finds its symbol on the shared spl-token mock.
 mock.module("@solana/spl-token", () => ({
   getAssociatedTokenAddressSync: (mint: unknown) => mint,
   getAccount: async () => ({ amount: 10_000_000_000n }),
   TokenAccountNotFoundError: class extends Error {},
+  getMint: async () => ({ decimals: 6 }),
 }));
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -185,6 +188,7 @@ describe("signAndSend confirmation paths (Phase 2)", () => {
       outputMint: TOKEN_MINT,
       amountSol: 0.1,
       slippageBps: 100,
+      decimals: 6,
     });
     expect(result.status).toBe("ok");
     if (result.status === "ok") {
@@ -210,6 +214,7 @@ describe("signAndSend confirmation paths (Phase 2)", () => {
       outputMint: TOKEN_MINT,
       amountSol: 0.1,
       slippageBps: 100,
+      decimals: 6,
     });
     expect(result.status).toBe("failed_onchain");
     if (result.status === "failed_onchain") {
@@ -235,6 +240,7 @@ describe("signAndSend confirmation paths (Phase 2)", () => {
       outputMint: TOKEN_MINT,
       amountSol: 0.1,
       slippageBps: 100,
+      decimals: 6,
     });
     expect(result.status).toBe("not_landed");
     if (result.status === "not_landed") {
@@ -256,6 +262,7 @@ describe("signAndSend confirmation paths (Phase 2)", () => {
       outputMint: TOKEN_MINT,
       amountSol: 0.1,
       slippageBps: 100,
+      decimals: 6,
     });
     expect(result.status).toBe("landed_after_timeout");
     if (result.status === "landed_after_timeout") {
@@ -281,6 +288,7 @@ describe("signAndSend confirmation paths (Phase 2)", () => {
       outputMint: TOKEN_MINT,
       amountSol: 0.1,
       slippageBps: 100,
+      decimals: 6,
     });
     expect(result.status).toBe("ok");
     // Initial send + at least one rebroadcast.

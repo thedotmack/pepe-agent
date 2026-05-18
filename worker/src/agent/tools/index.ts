@@ -213,35 +213,39 @@ export function createPepeMcpServer(
         }
       }
 
-      // For SELL, convert UI tokens → atomic uint64 using the on-chain mint
-      // decimals. Anti-pattern guard from PLAN-real-go-live.md Phase 1: never
-      // hardcode decimals.
+      // Both BUY and SELL need mint decimals: BUY persists them on the
+      // position row so position-monitor's price math is unit-correct; SELL
+      // converts UI tokens → atomic uint64 for Jupiter. Anti-pattern guard
+      // from PLAN-real-go-live.md Phase 1 / Phase 3: never hardcode decimals.
       let sellAmountAtomic: bigint | undefined;
-      let sellDecimals: number | undefined;
+      let mintDecimals: number | undefined;
+      try {
+        const rpc = new Connection(defaultRpcUrl(), "confirmed");
+        // BUY: decimals of tokenOut (the bought token).
+        // SELL: decimals of tokenIn (the sold token == position mint).
+        const mintForDecimals = side === "BUY" ? input.tokenOut : input.tokenIn;
+        const mintInfo = await getMint(rpc, new PublicKey(mintForDecimals));
+        mintDecimals = mintInfo.decimals;
+      } catch (err) {
+        log.error(`getMint failed for ${side} ${input.tokenIn}→${input.tokenOut}: ${String(err)}`);
+        stateStore.setPhase("WATCHING");
+        return {
+          content: [{ type: "text", text: `denied: could not fetch mint info: ${String(err)}` }],
+          isError: true,
+        };
+      }
       if (side === "SELL") {
-        try {
-          const rpc = new Connection(defaultRpcUrl(), "confirmed");
-          const mintInfo = await getMint(rpc, new PublicKey(input.tokenIn));
-          sellDecimals = mintInfo.decimals;
-          const atomicPerToken = 10n ** BigInt(sellDecimals);
-          // Floor: don't request more than the user asked, even if float repr
-          // would round up.
-          const ui = input.sellAmountTokens as number;
-          const whole = BigInt(Math.floor(ui));
-          const frac = BigInt(Math.floor((ui - Math.floor(ui)) * Number(atomicPerToken)));
-          sellAmountAtomic = whole * atomicPerToken + frac;
-          if (sellAmountAtomic <= 0n) {
-            stateStore.setPhase("WATCHING");
-            return {
-              content: [{ type: "text", text: "denied: SELL amount rounds to 0 atomic units" }],
-              isError: true,
-            };
-          }
-        } catch (err) {
-          log.error(`getMint failed for ${input.tokenIn}: ${String(err)}`);
+        const atomicPerToken = 10n ** BigInt(mintDecimals);
+        // Floor: don't request more than the user asked, even if float repr
+        // would round up.
+        const ui = input.sellAmountTokens as number;
+        const whole = BigInt(Math.floor(ui));
+        const frac = BigInt(Math.floor((ui - Math.floor(ui)) * Number(atomicPerToken)));
+        sellAmountAtomic = whole * atomicPerToken + frac;
+        if (sellAmountAtomic <= 0n) {
           stateStore.setPhase("WATCHING");
           return {
-            content: [{ type: "text", text: `denied: could not fetch mint info: ${String(err)}` }],
+            content: [{ type: "text", text: "denied: SELL amount rounds to 0 atomic units" }],
             isError: true,
           };
         }
@@ -261,12 +265,14 @@ export function createPepeMcpServer(
                 outputMint: input.tokenOut,
                 amountSol: input.amountSol as number,
                 slippageBps: input.slippageBps,
+                decimals: mintDecimals as number,
               }
             : {
                 inputMint: input.tokenIn,
                 outputMint: input.tokenOut,
                 sellAmountAtomic: sellAmountAtomic as bigint,
                 slippageBps: input.slippageBps,
+                decimals: mintDecimals as number,
               },
         );
         switch (result.status) {
@@ -382,6 +388,7 @@ export function createPepeMcpServer(
             tokenId: input.tokenOut,
             entryPriceSolPerToken: executedPriceSolPerToken ?? 0,
             sizeSol: input.amountSol as number,
+            decimals: mintDecimals as number,
           });
 
           stateStore.recordDecision({
@@ -498,11 +505,15 @@ export function createPepeMcpServer(
           isError: true,
         };
       }
+      // Manual entry path — we don't fetch decimals here. Use SOL's 9 as a
+      // conservative bootstrap; position-monitor will lazy-fetch + backfill
+      // via setPositionDecimals on first tick if this is wrong.
       ledger.openPosition({
         tokenId,
         symbol,
         entryPriceSolPerToken,
         sizeSol,
+        decimals: 9,
       });
       stateStore.setSelectedToken(tokenId);
       return { content: [{ type: "text", text: `opened ${tokenId} (${reason})` }] };

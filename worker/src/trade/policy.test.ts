@@ -39,8 +39,10 @@ function fakeLedger(state: FakeLedgerState): TradeLedger {
         entryPriceSolPerToken: 0.001,
         sizeSol: 0.05,
         openedAt: 0,
+        decimals: 6,
       })),
     openPosition: () => {},
+    setPositionDecimals: () => {},
     closePosition: () => {},
     close: () => {},
   };

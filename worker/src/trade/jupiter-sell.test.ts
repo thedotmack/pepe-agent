@@ -58,6 +58,9 @@ mock.module("@solana/spl-token", () => ({
     return { amount: 10_000_000_000n };
   },
   TokenAccountNotFoundError: FakeTokenAccountNotFoundError,
+  // getMint is included so position-monitor-math.test.ts finds its symbol
+  // on the shared spl-token mock when both files run in one bun test run.
+  getMint: async () => ({ decimals: 6 }),
 }));
 
 // Stub the web3.js Connection so executeTrade's `new Connection(...)` returns
@@ -169,6 +172,7 @@ describe("executeTrade (SELL / TOKEN→SOL)", () => {
       outputMint: SOL_MINT,
       sellAmountAtomic: 1000n,
       slippageBps: 100,
+      decimals: 6,
     });
     expect(result.status).toBe("ok");
     if (result.status === "ok") {
@@ -185,6 +189,7 @@ describe("executeTrade (SELL / TOKEN→SOL)", () => {
       outputMint: SOL_MINT,
       sellAmountAtomic: 123_456_789n,
       slippageBps: 50,
+      decimals: 6,
     });
     expect(lastQuoteUrl).not.toBeNull();
     const params = new URL(lastQuoteUrl as unknown as string).searchParams;
@@ -201,6 +206,7 @@ describe("executeTrade (SELL / TOKEN→SOL)", () => {
       outputMint: SOL_MINT,
       sellAmountAtomic: 1000n,
       slippageBps: 100,
+      decimals: 6,
     });
     expect(lastSwapBody).not.toBeNull();
     expect((lastSwapBody as { wrapAndUnwrapSol: boolean }).wrapAndUnwrapSol).toBe(true);
@@ -213,6 +219,7 @@ describe("executeTrade (SELL / TOKEN→SOL)", () => {
       outputMint: SOL_MINT,
       sellAmountAtomic: 1000n,
       slippageBps: 100,
+      decimals: 6,
     });
     expect(result.status).toBe("no_token_account");
     if (result.status === "no_token_account") {
@@ -229,6 +236,7 @@ describe("executeTrade (SELL / TOKEN→SOL)", () => {
         sellAmountAtomic: 1000n,
         amountSol: 0.1,
         slippageBps: 100,
+        decimals: 6,
       }),
     ).rejects.toThrow(/SELL rejects amountSol/);
   });
@@ -240,6 +248,7 @@ describe("executeTrade (SELL / TOKEN→SOL)", () => {
         outputMint: "OtherMintYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY",
         sellAmountAtomic: 1000n,
         slippageBps: 100,
+        decimals: 6,
       }),
     ).rejects.toThrow(/SOL↔TOKEN/);
   });

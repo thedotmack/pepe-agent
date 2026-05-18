@@ -10,10 +10,11 @@
  *
  * Tables:
  *   trades(id, ts, tokenIn, tokenOut, side, amountSol, txid?, executedPriceSolPerToken?, reason)
- *   positions(tokenId PK, symbol?, entryPriceSolPerToken, sizeSol, openedAt, closedAt?)
+ *   positions(tokenId PK, symbol?, entryPriceSolPerToken, sizeSol, openedAt, closedAt?, decimals)
  *
- * No migration framework — just `CREATE IF NOT EXISTS`. Add a new column?
- * Write the ALTER yourself in this file. Phase 4 keeps it ruthless.
+ * No migration framework — just `CREATE IF NOT EXISTS` + PRAGMA-gated
+ * `ALTER TABLE`. Add a new column? Write the ALTER yourself in this file.
+ * Phase 4 keeps it ruthless.
  */
 import { Database } from "bun:sqlite";
 import { mkdirSync, existsSync, accessSync, constants } from "node:fs";
@@ -40,13 +41,21 @@ export interface TradeLedger {
     entryPriceSolPerToken: number;
     sizeSol: number;
     openedAt: number;
+    decimals: number;
   }>;
   openPosition(input: {
     tokenId: string;
     symbol?: string;
     entryPriceSolPerToken: number;
     sizeSol: number;
+    decimals: number;
   }): void;
+  /**
+   * Backfill decimals for a legacy position row that was opened before the
+   * column existed (or stored a bootstrap default). Phase 3 calls this from
+   * position-monitor when it has to lazy-fetch getMint for the first tick.
+   */
+  setPositionDecimals(tokenId: string, decimals: number): void;
   closePosition(tokenId: string): void;
   close(): void;
 }
@@ -95,11 +104,27 @@ CREATE TABLE IF NOT EXISTS positions (
   entryPriceSolPerToken REAL NOT NULL,
   sizeSol REAL NOT NULL,
   openedAt INTEGER NOT NULL,
-  closedAt INTEGER
+  closedAt INTEGER,
+  decimals INTEGER NOT NULL DEFAULT 9
 );
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_txid_unique ON trades(txid) WHERE txid IS NOT NULL;
 `;
+
+// citation: SQLite ADD COLUMN with DEFAULT backfills existing rows; PRAGMA
+// table_info gates the ALTER so we never get "duplicate column" on second boot.
+// https://www.sqlite.org/lang_altertable.html#altertabaddcol
+function migratePositionsDecimals(db: Database): void {
+  const cols = db.prepare(`PRAGMA table_info(positions)`).all() as Array<{
+    name: string;
+  }>;
+  const hasDecimals = cols.some((c) => c.name === "decimals");
+  if (!hasDecimals) {
+    db.exec(
+      `ALTER TABLE positions ADD COLUMN decimals INTEGER NOT NULL DEFAULT 9`,
+    );
+  }
+}
 
 export function openLedger(): TradeLedger {
   const dir = pickDbDir();
@@ -107,6 +132,7 @@ export function openLedger(): TradeLedger {
   const db = new Database(dbPath);
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec(SCHEMA_SQL);
+  migratePositionsDecimals(db);
 
   const insertTrade = db.prepare(
     `INSERT INTO trades (ts, tokenIn, tokenOut, side, amountSol, txid, executedPriceSolPerToken, reason)
@@ -124,20 +150,24 @@ export function openLedger(): TradeLedger {
       WHERE side = 'BUY' AND ts >= $since`
   );
   const openPositionsStmt = db.prepare(
-    `SELECT tokenId, symbol, entryPriceSolPerToken, sizeSol, openedAt
+    `SELECT tokenId, symbol, entryPriceSolPerToken, sizeSol, openedAt, decimals
        FROM positions
       WHERE closedAt IS NULL
       ORDER BY openedAt ASC`
   );
   const upsertPositionStmt = db.prepare(
-    `INSERT INTO positions (tokenId, symbol, entryPriceSolPerToken, sizeSol, openedAt, closedAt)
-     VALUES ($tokenId, $symbol, $entryPriceSolPerToken, $sizeSol, $openedAt, NULL)
+    `INSERT INTO positions (tokenId, symbol, entryPriceSolPerToken, sizeSol, openedAt, closedAt, decimals)
+     VALUES ($tokenId, $symbol, $entryPriceSolPerToken, $sizeSol, $openedAt, NULL, $decimals)
      ON CONFLICT(tokenId) DO UPDATE SET
        symbol = excluded.symbol,
        entryPriceSolPerToken = excluded.entryPriceSolPerToken,
        sizeSol = excluded.sizeSol,
        openedAt = excluded.openedAt,
+       decimals = excluded.decimals,
        closedAt = NULL`
+  );
+  const setDecimalsStmt = db.prepare(
+    `UPDATE positions SET decimals = $decimals WHERE tokenId = $tokenId`
   );
   const closePositionStmt = db.prepare(
     `UPDATE positions SET closedAt = $closedAt WHERE tokenId = $tokenId AND closedAt IS NULL`
@@ -178,6 +208,7 @@ export function openLedger(): TradeLedger {
         entryPriceSolPerToken: number;
         sizeSol: number;
         openedAt: number;
+        decimals: number;
       }>;
     },
     openPosition(input) {
@@ -187,7 +218,11 @@ export function openLedger(): TradeLedger {
         $entryPriceSolPerToken: input.entryPriceSolPerToken,
         $sizeSol: input.sizeSol,
         $openedAt: Date.now(),
+        $decimals: input.decimals,
       });
+    },
+    setPositionDecimals(tokenId, decimals) {
+      setDecimalsStmt.run({ $tokenId: tokenId, $decimals: decimals });
     },
     closePosition(tokenId) {
       closePositionStmt.run({

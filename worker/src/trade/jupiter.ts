@@ -293,6 +293,9 @@ export type ExecuteTradeArgs = {
   amountSol?: number;
   /** TOKEN→SOL: amount of input token to sell, in raw atomic units. Mutually exclusive with amountSol. */
   sellAmountAtomic?: bigint;
+  /** Decimals of the non-SOL token in the pair. Required so executedPriceSolPerToken
+   *  is reported in SOL-per-UI-token (matching position-monitor's price units). */
+  decimals: number;
 };
 
 export type ExecuteTradeResult =
@@ -333,8 +336,11 @@ export type ExecuteTradeResult =
  * `wrapAndUnwrapSol: true` automatically unwraps WSOL output back to native
  * SOL — we do not create a close-account instruction ourselves.
  *
- * `executedPriceSolPerToken` is reported as SOL-per-atomic-token (matching
- * the existing ledger convention). Caller can decimals-correct downstream.
+ * `executedPriceSolPerToken` is reported as SOL-per-UI-token (Phase 3): the
+ * caller passes the non-SOL mint's decimals so we can divide atomic amounts
+ * down to full-token units before computing the price ratio. This matches
+ * the units used by position-monitor's `entryPriceSolPerToken` so PnL math
+ * is consistent across the ledger.
  */
 export async function executeTrade(
   args: ExecuteTradeArgs,
@@ -415,19 +421,20 @@ export async function executeTrade(
   });
   const sendResult = await signAndSend(swapTransaction, connection, lastValidBlockHeight);
 
-  // For BUY: inAmount = lamports spent, outAmount = atomic tokens received →
-  //   SOL per atomic-token = inLamports/1e9 / outAtomic.
-  // For SELL: inAmount = atomic tokens sold, outAmount = lamports received →
-  //   SOL per atomic-token = outLamports/1e9 / inAtomic.
-  // NOTE: Phase 3 owns the atomic-vs-UI fix for this math; leaving the
-  // formula intact here so Phase 3's refactor target stays obvious.
+  // SOL per UI-token (Phase 3): divide lamports → SOL (÷ 1e9) and divide
+  // atomic-token amounts → UI tokens (÷ 10^decimals) before taking the ratio.
+  // This matches position-monitor's `entryPriceSolPerToken` units so PnL
+  // math is unit-consistent across the ledger.
+  //   BUY:  inAmount = lamports spent,    outAmount = atomic tokens received
+  //   SELL: inAmount = atomic tokens sold, outAmount = lamports received
   const inAmt = Number(quote.inAmount);
   const outAmt = Number(quote.outAmount);
+  const tokenAtomicPerUi = 10 ** args.decimals;
   let executedPriceSolPerToken: number | null = null;
   if (Number.isFinite(inAmt) && Number.isFinite(outAmt) && inAmt > 0 && outAmt > 0) {
     executedPriceSolPerToken = isBuy
-      ? inAmt / 1e9 / outAmt
-      : outAmt / 1e9 / inAmt;
+      ? (inAmt / 1e9) / (outAmt / tokenAtomicPerUi)
+      : (outAmt / 1e9) / (inAmt / tokenAtomicPerUi);
   }
 
   switch (sendResult.status) {
