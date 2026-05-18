@@ -34,11 +34,27 @@ export const MAX_OPEN_POSITIONS = 5;
 export const DEFAULT_SLIPPAGE_BPS = 100;
 export const SLIPPAGE_HARD_CAP_BPS = 300;
 
+// BRIEF §7.2 entry gates — single source of truth. Imported by auto-tick.ts
+// so the agent only sees candidates that meet our thesis bar.
+export const MIN_FIVE_MIN_GAIN = 0.15;
+export const MIN_BUY_PRESSURE_5M = 0.7;
+export const MIN_LIQUIDITY_USD = 50_000;
+export const MIN_UPDATES_PER_MINUTE = 20;
+
+// BRIEF §7.4 + §10 — when wallet drops below this, narrate "TANK EMPTY".
+export const TANK_EMPTY_THRESHOLD_SOL = 0.05;
+
 export interface PolicyContext {
   ledger: TradeLedger;
   killSwitchTripped: () => boolean;
   walletAvailable: boolean;
   now: () => number;
+  /**
+   * Wallet SOL balance accessor. Optional with `() => Infinity` default so
+   * existing call-sites and tests keep working. When provided, gates
+   * trades on the BRIEF §7.4 TANK-EMPTY threshold.
+   */
+  walletSolBalance?: () => number;
 }
 
 export function checkTradePolicy(
@@ -52,6 +68,13 @@ export function checkTradePolicy(
     return {
       allow: false,
       reason: "no wallet configured (set AGENT_WALLET_PRIVATE_KEY_BASE58)",
+    };
+  }
+  const walletSolBalance = ctx.walletSolBalance ?? (() => Infinity);
+  if (walletSolBalance() < TANK_EMPTY_THRESHOLD_SOL) {
+    return {
+      allow: false,
+      reason: `TANK EMPTY (wallet < ${TANK_EMPTY_THRESHOLD_SOL} SOL)`,
     };
   }
   if (!Number.isFinite(intent.amountSol) || intent.amountSol <= 0) {

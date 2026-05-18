@@ -55,6 +55,13 @@ export interface CreateAgentLoopArgs {
   memClient: ClaudeMemClient;
   contentSessionId: string;
   stateStore: StateStore;
+  /**
+   * Optional accessor for the live wallet SOL balance. Plumbed into the
+   * trade-policy context so all three policy gates (hook, canUseTool,
+   * handler) see the same TANK-EMPTY signal. Defaults to `() => Infinity`
+   * (no balance gate) when omitted.
+   */
+  getWalletSolBalance?: () => number;
 }
 
 export interface AgentLoopHandle {
@@ -86,7 +93,15 @@ function extractAssistantText(msg: SDKMessage): string | null {
 }
 
 export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { start: () => void } {
-  const { subscriber, killSwitchRef, ledger, memClient, contentSessionId, stateStore } = args;
+  const {
+    subscriber,
+    killSwitchRef,
+    ledger,
+    memClient,
+    contentSessionId,
+    stateStore,
+    getWalletSolBalance,
+  } = args;
 
   const outbound = new EventEmitter();
   outbound.setMaxListeners(50);
@@ -102,6 +117,7 @@ export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { 
     walletAvailable: walletAvailable(),
     now: () => Date.now(),
     killSwitchTripped: () => killSwitchRef.tripped,
+    walletSolBalance: getWalletSolBalance ?? (() => Infinity),
   };
 
   const policyCheck = (intent: TradeIntent) =>

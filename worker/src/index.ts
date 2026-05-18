@@ -1,3 +1,4 @@
+import { Connection, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import { config } from "./config.ts";
 import { createLogger } from "./logger.ts";
 import { startWorkerServer } from "./rpc/worker-server.ts";
@@ -6,6 +7,8 @@ import { createClaudeMemClient } from "./memory/claude-mem-client.ts";
 import { mintContentSessionId } from "./memory/session.ts";
 import { startMemoryTick } from "./memory/tick.ts";
 import { createAgentLoop } from "./agent/loop.ts";
+import { startAutoTick } from "./agent/auto-tick.ts";
+import { startPositionMonitor } from "./agent/position-monitor.ts";
 import { openLedger } from "./trade/ledger.ts";
 import { tryGetPublicKey } from "./trade/wallet.ts";
 import { createStateStore, type FeedStatus } from "./state.ts";
@@ -39,11 +42,54 @@ async function main() {
   // Phase 5: kill switch + state store (created up front so the worker server
   // can serve /state and /kill from boot, even before the agent loop starts).
   const killSwitchRef = { tripped: false };
+  if (process.env.KILL_SWITCH === "1") {
+    killSwitchRef.tripped = true;
+    log.warn("KILL_SWITCH=1 — trades will be denied");
+  }
+
+  // Phase 4: wallet-balance poll. Cached outer variable updated every 15s
+  // (RPC is rate-limited). Both stateStore.snapshot() and the agent's
+  // policy-context closure read from this same cache so they're consistent.
+  let walletSolCached = 0;
+  let balancePoll: ReturnType<typeof setInterval> | null = null;
+  if (walletPubkey) {
+    try {
+      const pubkey = new PublicKey(walletPubkey);
+      const rpcUrl =
+        config.SOLANA_RPC_URL ??
+        (config.SOLANA_NETWORK === "devnet"
+          ? "https://api.devnet.solana.com"
+          : config.SOLANA_NETWORK === "testnet"
+            ? "https://api.testnet.solana.com"
+            : null);
+      if (rpcUrl) {
+        const rpc = new Connection(rpcUrl, "confirmed");
+        const refreshBalance = async () => {
+          try {
+            const lamports = await rpc.getBalance(pubkey, "confirmed");
+            walletSolCached = lamports / LAMPORTS_PER_SOL;
+          } catch (err) {
+            log.warn(`balance fetch failed: ${String(err)}`);
+          }
+        };
+        await refreshBalance();
+        balancePoll = setInterval(refreshBalance, 15_000);
+        if (typeof balancePoll.unref === "function") balancePoll.unref();
+        log.info(`wallet balance poll started (initial=${walletSolCached.toFixed(4)} SOL)`);
+      } else {
+        log.warn("SOLANA_RPC_URL not set for mainnet — wallet balance disabled");
+      }
+    } catch (err) {
+      log.warn(`wallet balance setup failed: ${String(err)}`);
+    }
+  }
+
   const stateStore = createStateStore({
     ledger,
     killSwitchRef,
     contentSessionId: null,
     walletPubkey: walletPubkey ?? null,
+    balanceProvider: () => walletSolCached,
   });
 
   // claude-mem client. Health-check on boot but never crash if it's down —
@@ -95,6 +141,8 @@ async function main() {
   // Agent loop (Phase 3). Boots only if ANTHROPIC_API_KEY is set; otherwise
   // the worker still serves subscribers + memory tick.
   let agent: ReturnType<typeof createAgentLoop> | null = null;
+  let autoTick: ReturnType<typeof startAutoTick> | null = null;
+  let positionMonitor: ReturnType<typeof startPositionMonitor> | null = null;
   if (config.ANTHROPIC_API_KEY) {
     try {
       agent = createAgentLoop({
@@ -104,6 +152,7 @@ async function main() {
         memClient,
         contentSessionId,
         stateStore,
+        getWalletSolBalance: () => walletSolCached,
       });
       agent.emitter.on("assistantText", (text: string) => {
         log.info(`[agent] ${text.slice(0, 200)}`);
@@ -113,6 +162,14 @@ async function main() {
       });
       agent.start();
       log.info("agent loop started");
+
+      // Phase 2 + Phase 3: autonomous entry + exit signallers. Must start
+      // AFTER agent.start() so emitter listeners are wired before the first
+      // tick fires.
+      autoTick = startAutoTick({ subscriber, agent, stateStore });
+      log.info("auto-tick started");
+      positionMonitor = startPositionMonitor({ ledger, agent, stateStore });
+      log.info("position-monitor started");
     } catch (err) {
       log.warn(`agent loop start failed (continuing without agent): ${String(err)}`);
       agent = null;
@@ -130,7 +187,10 @@ async function main() {
 
   const shutdown = async (signal: string) => {
     log.warn(`received ${signal}, shutting down`);
+    if (autoTick) autoTick.stop();
+    if (positionMonitor) positionMonitor.stop();
     if (agent) agent.stop();
+    if (balancePoll) clearInterval(balancePoll);
     clearInterval(stateTick);
     tick.stop();
     subscriber.stop();

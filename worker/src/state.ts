@@ -46,6 +46,11 @@ export interface CreateStateStoreArgs {
   killSwitchRef: { tripped: boolean };
   contentSessionId: string | null;
   walletPubkey: string | null;
+  /**
+   * Optional accessor returning the live SOL balance. When omitted, snapshot
+   * reports `walletSol: 0` (legacy behavior).
+   */
+  balanceProvider?: () => number;
 }
 
 const MAX_DECISION_LOG = 10;
@@ -54,7 +59,7 @@ const TRADING_HOLD_MS = 2_000;
 const IDLE_TIMEOUT_MS = 5_000;
 
 export function createStateStore(args: CreateStateStoreArgs): StateStore {
-  const { ledger, killSwitchRef, walletPubkey } = args;
+  const { ledger, killSwitchRef, walletPubkey, balanceProvider } = args;
 
   let phase: AgentPhase = "IDLE";
   let selectedTokenId: string | null = null;
@@ -70,7 +75,7 @@ export function createStateStore(args: CreateStateStoreArgs): StateStore {
       phase,
       selectedTokenId,
       callingSinceMs,
-      walletSol: 0,
+      walletSol: balanceProvider?.() ?? 0,
       pnlUsd: 0,
       openPositions: ledger.openPositions().length,
       killSwitch: killSwitchRef.tripped,
