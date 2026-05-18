@@ -65,11 +65,22 @@ export interface PolicyContext {
   walletAvailable: boolean;
   now: () => number;
   /**
-   * Wallet SOL balance accessor. Optional with `() => Infinity` default so
-   * existing call-sites and tests keep working. When provided, gates
-   * trades on the BRIEF §7.4 TANK-EMPTY threshold.
+   * Wallet SOL balance accessor. Returns `number | null` so the policy can
+   * distinguish two failure modes that look identical on the wire but mean
+   * very different things operationally:
+   *
+   *   - `null`  → UNKNOWN. We haven't successfully fetched a balance from
+   *               RPC (poll never succeeded, or accessor not wired). Treat
+   *               as deny-BUY (never fail open) but allow-SELL (you must
+   *               still be able to exit when RPC is flaky).
+   *   - number  → known balance in SOL. Compared against
+   *               TANK_EMPTY_THRESHOLD_SOL on BUY only.
+   *
+   * Optional with `() => null` default so the BUY path is gated closed
+   * when no accessor is wired. The old `() => Infinity` default was the
+   * root cause of audit finding #9 (balance polling fails open).
    */
-  walletSolBalance?: () => number;
+  walletSolBalance?: () => number | null;
 }
 
 export function checkTradePolicy(
@@ -85,11 +96,30 @@ export function checkTradePolicy(
       reason: "no wallet configured (set AGENT_WALLET_PRIVATE_KEY_BASE58)",
     };
   }
-  // TANK-EMPTY gates BUYs only. SELLs are emergency exits — the whole
-  // point of selling at low SOL is to recover SOL. Audit finding #4
+  // Balance gates BUYs only — SELLs are emergency exits (the whole point
+  // of selling at low SOL is to recover SOL). Audit finding #4
   // (PLAN-real-go-live.md Phase 5).
-  const walletSolBalance = ctx.walletSolBalance ?? (() => Infinity);
-  if (intent.side === "BUY" && walletSolBalance() < TANK_EMPTY_THRESHOLD_SOL) {
+  //
+  // Phase 6 / audit finding #9: distinguish UNKNOWN (null) from TANK_EMPTY
+  // (low numeric value). UNKNOWN must deny BUY — never fail open if RPC is
+  // down or the accessor isn't wired. UNKNOWN must allow SELL so flaky RPC
+  // doesn't strand a position. The `() => null` default in the loop wiring
+  // means an unwired context blocks BUYs by design.
+  const balanceAccessor = ctx.walletSolBalance ?? (() => null);
+  const balance = balanceAccessor();
+  if (intent.side === "BUY" && balance === null) {
+    return {
+      allow: false,
+      reason: "wallet balance UNKNOWN (RPC failed or balance not yet fetched)",
+    };
+  }
+  // Defensive: only compare TANK_EMPTY when balance is a real number.
+  // The null branch above already denied BUYs; SELLs explicitly skip both.
+  if (
+    intent.side === "BUY" &&
+    balance !== null &&
+    balance < TANK_EMPTY_THRESHOLD_SOL
+  ) {
     return {
       allow: false,
       reason: `TANK EMPTY (wallet < ${TANK_EMPTY_THRESHOLD_SOL} SOL)`,

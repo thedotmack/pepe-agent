@@ -10,3 +10,6 @@ node_modules/
 # trade ledger + agent SDK session state (local + container volumes)
 .data/
 .sessions/
+
+# Phase 6 / audit finding #10: worker secrets must never land in git.
+worker/.env

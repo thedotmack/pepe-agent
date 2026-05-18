@@ -58,10 +58,14 @@ export interface CreateAgentLoopArgs {
   /**
    * Optional accessor for the live wallet SOL balance. Plumbed into the
    * trade-policy context so all three policy gates (hook, canUseTool,
-   * handler) see the same TANK-EMPTY signal. Defaults to `() => Infinity`
-   * (no balance gate) when omitted.
+   * handler) see the same TANK-EMPTY / UNKNOWN signal.
+   *
+   * Phase 6: returns `number | null`. `null` means "balance unknown" (e.g.
+   * RPC poll never succeeded). The policy treats UNKNOWN as deny-BUY but
+   * allow-SELL. When omitted, defaults to `() => null` so the BUY path is
+   * gated closed by default — never fail open. Audit finding #9.
    */
-  getWalletSolBalance?: () => number;
+  getWalletSolBalance?: () => number | null;
 }
 
 export interface AgentLoopHandle {
@@ -117,7 +121,10 @@ export function createAgentLoop(args: CreateAgentLoopArgs): AgentLoopHandle & { 
     walletAvailable: walletAvailable(),
     now: () => Date.now(),
     killSwitchTripped: () => killSwitchRef.tripped,
-    walletSolBalance: getWalletSolBalance ?? (() => Infinity),
+    // Phase 6: default to `() => null` (UNKNOWN) when no accessor is wired.
+    // The old `() => Infinity` default fails open — a BUY would silently
+    // skip the TANK_EMPTY gate. Audit finding #9.
+    walletSolBalance: getWalletSolBalance ?? (() => null),
   };
 
   const policyCheck = (intent: TradeIntent) =>

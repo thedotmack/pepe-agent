@@ -82,6 +82,10 @@ function ctx(overrides: Partial<PolicyContext> & { state?: Partial<FakeLedgerSta
     killSwitchTripped: () => false,
     walletAvailable: true,
     now: () => 1_000_000_000,
+    // Phase 6: default to a healthy balance so existing BUY tests stay
+    // green. Tests that exercise UNKNOWN or TANK_EMPTY behavior override
+    // this explicitly. Audit finding #9.
+    walletSolBalance: () => 1.5,
     ...overrides,
   };
 }
@@ -265,5 +269,70 @@ describe("checkTradePolicy", () => {
     );
     expect(r.allow).toBe(false);
     if (!r.allow) expect(r.reason).toMatch(/slippage/);
+  });
+
+  // ─── Phase 6: UNKNOWN balance state (audit finding #9) ─────────────────
+  // The accessor returns `number | null`. `null` means RPC failed or the
+  // poll never succeeded. UNKNOWN must deny BUYs (never fail open) but
+  // allow SELLs (you must be able to exit when RPC is flaky).
+
+  it("BUY: denies when wallet balance is UNKNOWN (null)", () => {
+    const r = checkTradePolicy(
+      validIntent,
+      ctx({ walletSolBalance: () => null })
+    );
+    expect(r.allow).toBe(false);
+    if (!r.allow) expect(r.reason).toMatch(/UNKNOWN/);
+  });
+
+  it("SELL: allows even when wallet balance is UNKNOWN (null)", () => {
+    // SELL must succeed even if RPC is down — emergency exit takes priority.
+    const r = checkTradePolicy(
+      validSellIntent,
+      ctx({ walletSolBalance: () => null })
+    );
+    expect(r.allow).toBe(true);
+  });
+
+  it("BUY: denies when walletSolBalance accessor is missing from context (in-policy default null)", () => {
+    // Hand-build a context with NO walletSolBalance to verify the policy's
+    // own `?? (() => null)` fallback denies BUY (never fail open). This is
+    // the direct regression test for audit finding #9: the old default was
+    // `() => Infinity`, which would have allowed this trade.
+    const r = checkTradePolicy(validIntent, {
+      ledger: ctx().ledger,
+      killSwitchTripped: () => false,
+      walletAvailable: true,
+      now: () => 1_000_000_000,
+      // walletSolBalance INTENTIONALLY omitted — exercises the in-policy default.
+    });
+    expect(r.allow).toBe(false);
+    if (!r.allow) expect(r.reason).toMatch(/UNKNOWN/);
+  });
+
+  it("SELL: allowed when walletSolBalance accessor is missing from context", () => {
+    const r = checkTradePolicy(validSellIntent, {
+      ledger: ctx().ledger,
+      killSwitchTripped: () => false,
+      walletAvailable: true,
+      now: () => 1_000_000_000,
+    });
+    expect(r.allow).toBe(true);
+  });
+
+  it("BUY: allowed at healthy SOL balance (regression)", () => {
+    const r = checkTradePolicy(
+      validIntent,
+      ctx({ walletSolBalance: () => 1.5 })
+    );
+    expect(r.allow).toBe(true);
+  });
+
+  it("SELL: allowed at healthy SOL balance (regression)", () => {
+    const r = checkTradePolicy(
+      validSellIntent,
+      ctx({ walletSolBalance: () => 1.5 })
+    );
+    expect(r.allow).toBe(true);
   });
 });

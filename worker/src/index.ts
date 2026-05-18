@@ -55,7 +55,13 @@ async function main() {
   // Phase 4: wallet-balance poll. Cached outer variable updated every 15s
   // (RPC is rate-limited). Both stateStore.snapshot() and the agent's
   // policy-context closure read from this same cache so they're consistent.
-  let walletSolCached = 0;
+  //
+  // Phase 6: `null` means "balance unknown" — we have never successfully
+  // fetched. RPC failures do NOT reset to null (we keep the last known good
+  // value). The policy distinguishes null (UNKNOWN, deny BUY) from a low
+  // numeric value (TANK_EMPTY). Audit finding #9: do not default to 0 or
+  // Infinity — both silently hide RPC outages.
+  let walletSolCached: number | null = null;
   let balancePoll: ReturnType<typeof setInterval> | null = null;
   if (walletPubkey) {
     try {
@@ -74,13 +80,26 @@ async function main() {
             const lamports = await rpc.getBalance(pubkey, "confirmed");
             walletSolCached = lamports / LAMPORTS_PER_SOL;
           } catch (err) {
+            // Intentionally do NOT reset walletSolCached here. If we had a
+            // good value, keep it; if we never had one, null persists and
+            // the policy denies BUYs until RPC recovers.
             log.warn(`balance fetch failed: ${String(err)}`);
           }
         };
         await refreshBalance();
         balancePoll = setInterval(refreshBalance, 15_000);
         if (typeof balancePoll.unref === "function") balancePoll.unref();
-        log.info(`wallet balance poll started (initial=${walletSolCached.toFixed(4)} SOL)`);
+        // Read via a getter to defeat TS control-flow narrowing of the
+        // closure-captured `walletSolCached` (which TS otherwise infers as
+        // `null` past the initializer, even after `await refreshBalance()`
+        // has reassigned it).
+        const readBalance = (): number | null => walletSolCached;
+        const initial = readBalance();
+        log.info(
+          `wallet balance poll started (initial=${
+            initial === null ? "UNKNOWN" : `${initial.toFixed(4)} SOL`
+          })`
+        );
       } else {
         log.warn("SOLANA_RPC_URL not set for mainnet — wallet balance disabled");
       }
@@ -94,7 +113,10 @@ async function main() {
     killSwitchRef,
     contentSessionId: null,
     walletPubkey: walletPubkey ?? null,
-    balanceProvider: () => walletSolCached,
+    // UI surface: 0 sentinel preserves legacy snapshot behavior when balance
+    // is UNKNOWN. The policy gate uses the nullable accessor (below) so it
+    // can distinguish UNKNOWN from a real low-SOL reading. Audit finding #9.
+    balanceProvider: () => walletSolCached ?? 0,
   });
 
   // claude-mem client. Health-check on boot but never crash if it's down —
@@ -157,7 +179,7 @@ async function main() {
         memClient,
         contentSessionId,
         stateStore,
-        getWalletSolBalance: () => walletSolCached,
+        getWalletSolBalance: (): number | null => walletSolCached,
       });
       agent.emitter.on("assistantText", (text: string) => {
         log.info(`[agent] ${text.slice(0, 200)}`);
