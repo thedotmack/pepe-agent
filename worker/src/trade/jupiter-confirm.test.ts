@@ -133,6 +133,18 @@ mock.module("@solana/web3.js", () => ({
   LAMPORTS_PER_SOL: 1_000_000_000,
 }));
 
+// Phase 12 (codex Phase 11 re-audit blocker #2b): quote fixture is now
+// overridable so the new route-liquidity tests can drive empty-route /
+// high-impact responses through executeTrade without touching the others.
+interface QuoteFixture {
+  routePlan: unknown[];
+  priceImpactPct: string;
+}
+const quoteFixture: QuoteFixture = {
+  routePlan: [{ swapInfo: { ammKey: "FakeRaydium" } }],
+  priceImpactPct: "0.001",
+};
+
 beforeAll(() => {
   globalThis.fetch = (async (url: string | URL | Request, _init?: RequestInit) => {
     const u = typeof url === "string" ? url : url.toString();
@@ -146,8 +158,14 @@ beforeAll(() => {
           otherAmountThreshold: "490000000",
           swapMode: "ExactIn",
           slippageBps: 100,
-          priceImpactPct: "0.001",
-          routePlan: [],
+          // Phase 12 (codex Phase 11 re-audit blocker #2b): executeTrade now
+          // runs checkRouteLiquidity on the authoritative /quote response
+          // before /swap. Non-empty route + tiny price impact matches the
+          // gate so the rest of the test exercises signAndSend. Tests that
+          // need to drive the route_liquidity_denied path override the
+          // fixture inline.
+          priceImpactPct: quoteFixture.priceImpactPct,
+          routePlan: quoteFixture.routePlan,
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
@@ -169,6 +187,11 @@ beforeAll(() => {
   }) as typeof fetch;
 });
 
+function resetQuoteFixture() {
+  quoteFixture.routePlan = [{ swapInfo: { ammKey: "FakeRaydium" } }];
+  quoteFixture.priceImpactPct = "0.001";
+}
+
 // Import AFTER mocks register. Phase 7 H2: pull the rebroadcast/timeout
 // constants in too so the rebroadcast-fires test drives timing off the
 // canonical values rather than a hard-coded 2_100ms sleep.
@@ -180,6 +203,9 @@ function resetRpc() {
   rpc.signatureStatusResult = async () => ({
     value: { err: null, confirmationStatus: "confirmed", slot: 1 },
   });
+  // Phase 12: also reset the /quote fixture so the new route-liquidity tests
+  // can mutate it without leaking state across `it()` blocks.
+  resetQuoteFixture();
 }
 
 describe("signAndSend confirmation paths (Phase 2)", () => {

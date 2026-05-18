@@ -41,6 +41,13 @@ import { getPublicKey } from "../../trade/wallet.ts";
 import type { ClaudeMemClient } from "../../memory/claude-mem-client.ts";
 import type { StateStore, KillSwitchRef as StateKillSwitchRef } from "../../state.ts";
 import { createLogger } from "../../logger.ts";
+// Phase 12 (codex Phase 11 re-audit blocker #1): wrap the pre-BUY and
+// post-BUY ATA reads in the same 10s RPC timeout as the position-monitor's
+// backfill. A hung getAccount call would otherwise wedge the trade handler
+// AFTER a confirmed swap on the wire — wallet changed, but ledger never
+// records. Same constant + helper as position-monitor so an operator only
+// learns one number.
+import { withRpcTimeout } from "../position-monitor.ts";
 
 const log = createLogger("agent.tools");
 
@@ -70,11 +77,32 @@ function rankToken(t: ActivityToken): number {
 }
 
 /**
- * Phase 11 (codex Phase 10 re-audit #4): read the post-BUY ATA balance and
- * return the delta over the pre-BUY balance. This is the EXACT on-chain
- * quantity that landed, after slippage. Falls back to BigInt(quoteOutAmount)
- * if either the post-balance read fails OR the delta is non-positive
- * (defensive — shouldn't happen on an "ok" / "landed_after_timeout" result).
+ * Phase 12 (codex Phase 11 re-audit blocker #1): read the post-BUY ATA
+ * balance and return the delta over the pre-BUY balance. This is the EXACT
+ * on-chain quantity that landed, after slippage.
+ *
+ * Phase 11 had two issues codex flagged:
+ *   - the getAccount call was UNBOUNDED (no timeout) — a hung RPC after a
+ *     confirmed BUY would wedge the trade handler with the swap already on
+ *     the wire and the position never recorded.
+ *   - any failure path (timeout / TokenAccountNotFoundError / other) fell
+ *     back to BigInt(quote.outAmount) and persisted THAT as the position
+ *     row's tokensReceivedAtomic. That's the QUOTED output, not the
+ *     slippage-adjusted reality — and worse, position-monitor's lazy
+ *     backfill only fires on rows where tokensReceivedAtomic === "0", so
+ *     storing a plausible-looking quote value LOSES SLIPPAGE TRUTH FOREVER.
+ *
+ * Phase 12 fix:
+ *   1. Wrap getAccount in withRpcTimeout (same 10s ceiling as
+ *      position-monitor) so the handler can't hang post-confirm.
+ *   2. On ANY failure path (timeout, TokenAccountNotFound, other, or a
+ *      non-positive delta), return 0n. The position-monitor backfills "0"
+ *      rows from the actual ATA on the next tick, so a transient RPC blip
+ *      self-heals within ~10s.
+ *   3. Never persist BigInt(quote.outAmount). quote.outAmount remains
+ *      useful for telemetry (we log it on failure), but the persisted value
+ *      is either (a) the real on-chain delta, or (b) the 0n sentinel
+ *      waiting for backfill — never the quoted promise.
  *
  * Why post-confirm-balance over quote.outAmount:
  *   - quote.outAmount is the QUOTED output (best-case fill).
@@ -82,45 +110,50 @@ function rankToken(t: ActivityToken): number {
  *     ⇒ up to 1% less).
  *   - storing the quote value overstates the position size, causing later
  *     SELL paths to over-request and hit insufficient_token_balance on exit.
- *
- * If even the fallback BigInt parse fails (malformed quote), return 0n so
- * the row stores "0" and position-monitor's lazy backfill recovers from the
- * ATA on the next tick.
  */
 async function readPostBuyDelta(
   outputMint: string,
   preBuyBalance: bigint,
   quoteOutAmount: string,
+  txid: string,
 ): Promise<bigint> {
   try {
     const rpc = new Connection(defaultRpcUrl(), "confirmed");
     const ownerPk = new PublicKey(getPublicKey());
     const ata = getAssociatedTokenAddressSync(new PublicKey(outputMint), ownerPk);
-    const acct = await getAccount(rpc, ata);
+    // Phase 12 blocker #1: bound the post-confirm getAccount with the same
+    // 10s ceiling as position-monitor's backfill. Without this an
+    // unreachable RPC would keep the handler hanging after the swap
+    // already landed.
+    const acct = await withRpcTimeout(
+      getAccount(rpc, ata),
+      `post-BUY getAccount(${outputMint})`,
+    );
     const delta = acct.amount - preBuyBalance;
     if (delta > 0n) return delta;
     // Defensive: a non-positive delta on a confirmed BUY means either
     // (a) we misread the pre-balance (race with another process touching
     // the same ATA — shouldn't happen but isn't impossible), or
     // (b) the tx landed but the swap somehow netted to 0 tokens — also
-    // shouldn't happen for an "ok" status. Fall back to the quote so the
-    // position row stores a plausible value; backfill from ATA fixes it
-    // next monitor tick if reality diverges further.
+    // shouldn't happen for an "ok" status. Phase 12 (#1): return the 0n
+    // sentinel so position-monitor's lazy backfill recovers the real value
+    // from chain on the next tick. Persisting BigInt(quote.outAmount) would
+    // hide the truth permanently.
     log.warn(
-      `post-BUY delta non-positive (${delta.toString()}) for ${outputMint}; falling back to quote.outAmount`,
+      `post-BUY delta non-positive (${delta.toString()}) for ${outputMint} txid=${txid}; ` +
+        `quote.outAmount=${String(quoteOutAmount)} (NOT persisted); ` +
+        `storing 0n sentinel for position-monitor backfill`,
     );
+    return 0n;
   } catch (err) {
+    // Phase 12 (#1): timeout, TokenAccountNotFoundError, or any other RPC
+    // failure all converge here. Persist the 0n sentinel — never the quote
+    // promise — so the position-monitor backfills with the real chain value
+    // on its next tick (typically within 10s).
     log.warn(
-      `post-BUY balance read failed for ${outputMint} (will fall back to quote.outAmount): ${String(err)}`,
-    );
-  }
-  // Fallback: parse the quote's outAmount. If THAT also fails, return 0n —
-  // position-monitor's lazy backfill recovers the real value from the ATA.
-  try {
-    return BigInt(quoteOutAmount);
-  } catch {
-    log.warn(
-      `quote.outAmount not bigint-parseable: ${String(quoteOutAmount)}; deferring to ATA backfill`,
+      `post-BUY balance read failed for ${outputMint} txid=${txid} (${String(err)}); ` +
+        `quote.outAmount=${String(quoteOutAmount)} (NOT persisted); ` +
+        `storing 0n sentinel for position-monitor backfill`,
     );
     return 0n;
   }
@@ -402,15 +435,38 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
           };
         }
       } catch (err) {
-        // Preview quote failed — log warn but proceed. executeTrade's own
-        // quote fetch will retry and surface a structured error path
-        // (no_token_account, insufficient_token_balance, or thrown). Failing
-        // closed here would create a false-positive deny when Jupiter is
-        // flaky; failing open here means a momentary Jupiter blip doesn't
-        // mask a legitimate trade attempt. Trade-off documented for codex.
+        // Phase 12 (codex Phase 11 re-audit blocker #2a): FAIL CLOSED. Phase
+        // 11 logged a warn and proceeded into executeTrade — codex correctly
+        // pointed out that a Jupiter blip on the preview /quote would let a
+        // no-route trade slip past the gate, because executeTrade's internal
+        // /quote was never route-checked before /swap. Phase 12 closes both
+        // gaps: the internal quote is now also gated (route_liquidity_denied
+        // variant), and the preview failure path denies the trade here. The
+        // agent retries on the next turn once Jupiter recovers. Trade-off:
+        // a one-shot Jupiter outage delays a legitimate trade by one tick,
+        // which is the right side to err on for a real-money loop.
         log.warn(
-          `submit_trade route-liquidity preview quote failed (continuing to executeTrade): ${String(err)}`,
+          `submit_trade preview quote unavailable (failing closed): ${String(err)}`,
         );
+        stateStore.recordDecision({
+          ts: Date.now(),
+          symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+          action: "PASS",
+          reason: `preview quote unavailable: ${String(err)}`,
+        });
+        stateStore.recordTradeResult(`preview quote unavailable: ${String(err)}`, {
+          side,
+          outcome: "denied_preview_quote_unavailable",
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `denied: preview quote unavailable (retry on next turn): ${String(err)}`,
+            },
+          ],
+          isError: true,
+        };
       }
 
       // Phase 4: tight kill switch check just before send. The PreToolUse
@@ -463,18 +519,28 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
             new PublicKey(input.tokenOut),
             ownerPk,
           );
-          const acct = await getAccount(rpc, ata);
+          // Phase 12 (codex Phase 11 re-audit blocker #1): bound the pre-BUY
+          // ATA read with the same 10s ceiling as position-monitor's
+          // backfill. A hung getAccount here would stall BEFORE we sign,
+          // wasting an agent turn on RPC weather. Same withRpcTimeout
+          // helper as the post-BUY read so failure modes are uniform.
+          const acct = await withRpcTimeout(
+            getAccount(rpc, ata),
+            `pre-BUY getAccount(${input.tokenOut})`,
+          );
           preBuyBalance = acct.amount;
         } catch (err) {
           // Most common case: ATA doesn't exist yet (Jupiter will create it
           // during the swap). TokenAccountNotFoundError ⇒ pre-balance is 0n,
-          // which is the correct value. Other errors get logged but don't
-          // abort the trade — we'll fall back to BigInt(quote.outAmount) for
-          // tokensReceivedAtomic in the post-branch if post-balance read also
-          // fails.
+          // which is the correct value. Other errors (including timeout
+          // from the withRpcTimeout wrap) get logged but don't abort the
+          // trade — preBuyBalance stays 0n. The post-BUY read will produce
+          // the real delta on success, or store the 0n sentinel for
+          // position-monitor backfill on failure. Either way, we never
+          // persist BigInt(quote.outAmount). Phase 12 blocker #1.
           if (!(err instanceof TokenAccountNotFoundError)) {
             log.warn(
-              `pre-BUY balance read failed for ${input.tokenOut} (will fall back to quote.outAmount on success): ${String(err)}`,
+              `pre-BUY balance read failed for ${input.tokenOut} (preBuyBalance=0n; post-BUY delta or 0n sentinel will be persisted): ${String(err)}`,
             );
           }
         }
@@ -510,17 +576,20 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
           case "ok":
             txid = result.txid;
             executedPriceSolPerToken = result.executedPriceSolPerToken;
-            // Phase 11 (codex Phase 10 re-audit #4): read post-confirm ATA
-            // balance for the actual delta, NOT quote.outAmount (the quote's
-            // PROMISED output, which differs from the slippage-adjusted real
-            // fill). Fall back to quote.outAmount only if the ATA read fails
-            // — better an approximate value than 0n, and position-monitor's
-            // lazy backfill will correct it next tick. SELL path unaffected.
+            // Phase 12 (codex Phase 11 re-audit blocker #1): read post-confirm
+            // ATA balance for the actual delta. On any failure (timeout,
+            // TokenAccountNotFound, other), readPostBuyDelta returns the 0n
+            // sentinel so position-monitor's lazy backfill recovers the real
+            // value from chain on the next tick. We never persist
+            // BigInt(quote.outAmount) — that would lose slippage truth
+            // permanently because backfill only fires on "0" rows. SELL path
+            // unaffected (its tokensReceivedAtomic was set at the BUY).
             if (side === "BUY") {
               tokensReceivedAtomic = await readPostBuyDelta(
                 input.tokenOut,
                 preBuyBalance,
                 result.quote.outAmount,
+                result.txid,
               );
             }
             break;
@@ -533,15 +602,16 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
             );
             txid = result.txid;
             executedPriceSolPerToken = result.executedPriceSolPerToken;
-            // Phase 11 (#4): same as "ok" — the tx did land, so reading the
-            // post-confirm ATA delta gives the real on-chain quantity. The
-            // tx landed late but the chain effect is real, so the balance
-            // read is valid.
+            // Phase 12 (#1): same as "ok" — the tx did land, so reading the
+            // post-confirm ATA delta gives the real on-chain quantity. On
+            // failure, the 0n sentinel + position-monitor backfill recover
+            // the truth; we never persist the quote promise.
             if (side === "BUY") {
               tokensReceivedAtomic = await readPostBuyDelta(
                 input.tokenOut,
                 preBuyBalance,
                 result.quote.outAmount,
+                result.txid,
               );
             }
             landedLate = true;
@@ -651,6 +721,40 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
                   text: result.txid
                     ? `execute-failed: tx ${result.txid} did not land within timeout`
                     : `execute-failed: ${result.reason ?? "aborted before send"} (no tx broadcast)`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          case "route_liquidity_denied": {
+            // Phase 12 (codex Phase 11 re-audit blocker #2b): the
+            // authoritative quote inside executeTrade — the one we'd actually
+            // pass to /swap — failed the route-liquidity gate. This is the
+            // structural deny: no route OR priceImpactPct above the 50% hard
+            // ceiling. No tx was signed and no lamports burned. The handler's
+            // own preview-quote gate above is best-effort and may use a
+            // slightly different /quote response (race window <100ms typical)
+            // — this catch is what guarantees we never submit a real-money
+            // /swap on a no-route quote, even if the preview happened to land
+            // in a healthy window.
+            log.warn(
+              `submit_trade route_liquidity_denied (post-quote): ${result.reason}`,
+            );
+            stateStore.recordDecision({
+              ts: Date.now(),
+              symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+              action: "PASS",
+              reason: `route-liquidity (post-quote): ${result.reason}`,
+            });
+            stateStore.recordTradeResult(
+              `route-liquidity (post-quote): ${result.reason}`,
+              { side, outcome: "denied_route_liquidity_post_quote" },
+            );
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `execute-failed: route-liquidity denied (post-quote): ${result.reason}`,
                 },
               ],
               isError: true,

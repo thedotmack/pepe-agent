@@ -52,15 +52,31 @@ let executeTradeImpl: (args: ExecuteTradeArgs) => Promise<ExecuteTradeResult> =
   };
 let lastExecuteArgs: ExecuteTradeArgs | null = null;
 
+// Phase 12 (codex Phase 11 re-audit blocker #2a): the handler now FAILS
+// CLOSED on a preview-quote error. Default getQuoteImpl returns a healthy
+// route so existing tests still exercise executeTrade; individual tests
+// override getQuoteImpl to drive the new fail-closed path.
+let getQuoteImpl: () => Promise<unknown> = async () => ({
+  inputMint: "x",
+  outputMint: "y",
+  inAmount: "1",
+  outAmount: "1",
+  otherAmountThreshold: "1",
+  swapMode: "ExactIn",
+  slippageBps: 100,
+  // Phase 12: route + priceImpactPct must satisfy checkRouteLiquidity (route
+  // non-empty AND impact ≤ 0.5). 0.001 == 0.1% is well within the gate.
+  priceImpactPct: "0.001",
+  routePlan: [{ swapInfo: { ammKey: "FakeRaydium" } }],
+});
+
 mock.module("../../trade/jupiter.ts", () => ({
   // Phase 7 H3: handler calls these three from jupiter.ts.
   executeTrade: async (args: ExecuteTradeArgs) => {
     lastExecuteArgs = args;
     return executeTradeImpl(args);
   },
-  getQuote: async () => {
-    throw new Error("getQuote not used in these tests");
-  },
+  getQuote: async () => getQuoteImpl(),
   defaultRpcUrl: () => "http://test.invalid",
   CONFIRM_TIMEOUT_MS: 90_000,
   REBROADCAST_INTERVAL_MS: 2_000,
@@ -69,10 +85,17 @@ mock.module("../../trade/jupiter.ts", () => ({
 // getMint resolves decimals before executeTrade. Fix at 9 so the SELL UI →
 // atomic conversion (H5) is deterministic.
 const mintDecimalsRef = { value: 9 };
+// Phase 12 (codex Phase 11 re-audit blocker #1): getAccountImpl is injectable
+// so individual tests can drive the pre-BUY / post-BUY ATA read into the
+// withRpcTimeout path. Default returns a positive amount so the post-BUY
+// delta math has a sane value.
+let getAccountImpl: () => Promise<{ amount: bigint }> = async () => ({
+  amount: 10_000_000_000n,
+});
 mock.module("@solana/spl-token", () => ({
   getMint: async () => ({ decimals: mintDecimalsRef.value }),
   getAssociatedTokenAddressSync: (mint: unknown) => mint,
-  getAccount: async () => ({ amount: 10_000_000_000n }),
+  getAccount: async () => getAccountImpl(),
   TokenAccountNotFoundError: class extends Error {},
 }));
 
@@ -335,6 +358,25 @@ beforeEach(() => {
     throw new Error("executeTradeImpl unset");
   };
   mintDecimalsRef.value = 9;
+  // Phase 12 (codex Phase 11 re-audit blocker #2a): reset getQuoteImpl to the
+  // healthy default so individual tests start from a known-good preview
+  // quote. Tests that exercise the fail-closed path override this inline.
+  getQuoteImpl = async () => ({
+    inputMint: "x",
+    outputMint: "y",
+    inAmount: "1",
+    outAmount: "1",
+    otherAmountThreshold: "1",
+    swapMode: "ExactIn",
+    slippageBps: 100,
+    priceImpactPct: "0.001",
+    routePlan: [{ swapInfo: { ammKey: "FakeRaydium" } }],
+  });
+  // Phase 12 (codex Phase 11 re-audit blocker #1): reset the pre/post-BUY
+  // getAccount behavior so tests that exercise the timeout path can opt in
+  // without leaking state into other tests. Default = a positive balance
+  // that the post-BUY delta math can read.
+  getAccountImpl = async () => ({ amount: 10_000_000_000n });
 });
 
 // ---------- Tests ----------

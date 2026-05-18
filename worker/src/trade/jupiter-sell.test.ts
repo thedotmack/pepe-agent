@@ -145,7 +145,12 @@ beforeAll(() => {
           swapMode: "ExactIn",
           slippageBps: 100,
           priceImpactPct: "0.001",
-          routePlan: [],
+          // Phase 12 (codex Phase 11 re-audit blocker #2b): executeTrade now
+          // runs checkRouteLiquidity on the /quote response before /swap.
+          // Non-empty route + tiny price impact matches the gate so SELL
+          // tests can still exercise the rest of the flow (ATA read,
+          // submitSwap, signAndSend, etc.).
+          routePlan: [{ swapInfo: { ammKey: "FakeRaydium" } }],
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       );

@@ -29,6 +29,11 @@ import {
 import { config } from "../config.ts";
 import { createLogger } from "../logger.ts";
 import { getKeypair, getPublicKey } from "./wallet.ts";
+// Phase 12 (codex Phase 11 re-audit blocker #2b): the authoritative quote
+// fetched inside executeTrade was never route-checked before submitSwap. The
+// handler's preview-quote gate was best-effort; this is the structural one.
+// Same module as the preview gate so policy stays single-source-of-truth.
+import { checkRouteLiquidity } from "./policy.ts";
 
 const log = createLogger("trade.jupiter");
 
@@ -413,6 +418,18 @@ export type ExecuteTradeResult =
       value: SignatureStatus;
       executedPriceSolPerToken: number | null;
       quote: QuoteResponse;
+    }
+  | {
+      // Phase 12 (codex Phase 11 re-audit blocker #2b): the AUTHORITATIVE
+      // quote — the one we'd actually pass to /swap — failed the route-
+      // liquidity gate. The handler's preview-quote gate at submit_trade
+      // entry is best-effort and may use a different /quote response (race
+      // window <100ms typical). This is the structural deny at the trade
+      // boundary: no route OR priceImpactPct above the 50% hard ceiling.
+      // Returned BEFORE submitSwap so no tx is signed, no lamports burned.
+      status: "route_liquidity_denied";
+      reason: string;
+      quote: QuoteResponse;
     };
 
 /**
@@ -510,6 +527,26 @@ export async function executeTrade(
     amount: amountAtomic,
     slippageBps: args.slippageBps,
   });
+
+  // Phase 12 (codex Phase 11 re-audit blocker #2b): structural route-
+  // liquidity gate on the AUTHORITATIVE quote — the one we're about to send
+  // to /swap. The handler's preview-quote gate at submit_trade entry is
+  // best-effort (a fresh /quote here may differ slightly) and previously
+  // FAILED OPEN when Jupiter blipped. This is the deny that matters: no
+  // route OR priceImpactPct above the 50% hard ceiling. Same gate function
+  // as the preview so policy stays single-source-of-truth. Returned before
+  // submitSwap so no tx is signed and no lamports are burned.
+  const liquidity = checkRouteLiquidity(quote);
+  if (!liquidity.allow) {
+    log.warn(
+      `executeTrade route-liquidity denied: ${liquidity.reason} for ${inputMint}→${outputMint}`,
+    );
+    return {
+      status: "route_liquidity_denied",
+      reason: liquidity.reason,
+      quote,
+    };
+  }
 
   const { swapTransaction, lastValidBlockHeight } = await submitSwap({
     quote,

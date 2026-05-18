@@ -66,8 +66,16 @@ const MONITOR_RPC_TIMEOUT_MS = 10_000;
  * the two timeout sites read identically. On timeout: rejects with a
  * descriptive Error so the caller's catch sees a real error message instead
  * of a silent AbortError. Callers log + skip, never crash.
+ *
+ * Phase 12 (codex Phase 11 re-audit blocker #1): exported so tools/index.ts
+ * can wrap the pre-BUY / post-BUY ATA balance reads in the same 10s ceiling.
+ * Without an overall-await bound a hung getAccount call would wedge the
+ * trade handler AFTER a confirmed swap — Jupiter's wsol unwrap landed, the
+ * user's wallet changed, but we never get to recordTrade / openPosition.
+ * Same ceiling as position-monitor's own backfill so an operator only learns
+ * one number.
  */
-function withRpcTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+export function withRpcTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
   return Promise.race([
     operation,
     new Promise<T>((_, reject) => {
