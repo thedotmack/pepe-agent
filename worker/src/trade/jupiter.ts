@@ -16,8 +16,15 @@
  */
 import {
   Connection,
+  PublicKey,
   VersionedTransaction,
 } from "@solana/web3.js";
+// spl-token signatures sourced from @solana/spl-token@0.4 d.ts (no skill present).
+import {
+  getAccount,
+  getAssociatedTokenAddressSync,
+  TokenAccountNotFoundError,
+} from "@solana/spl-token";
 import { config } from "../config.ts";
 import { getKeypair, getPublicKey } from "./wallet.ts";
 
@@ -42,7 +49,7 @@ function resolveMint(mint: string): string {
   return mint === "SOL" ? SOL_MINT : mint;
 }
 
-function defaultRpcUrl(): string {
+export function defaultRpcUrl(): string {
   if (config.SOLANA_RPC_URL) return config.SOLANA_RPC_URL;
   if (config.SOLANA_NETWORK === "devnet") return "https://api.devnet.solana.com";
   if (config.SOLANA_NETWORK === "testnet") return "https://api.testnet.solana.com";
@@ -128,57 +135,129 @@ export async function signAndSend(
   return { txid };
 }
 
+export type ExecuteTradeArgs = {
+  inputMint: string;
+  outputMint: string;
+  slippageBps: number;
+  /** SOL→TOKEN: amount of SOL to spend (UI units). Mutually exclusive with sellAmountAtomic. */
+  amountSol?: number;
+  /** TOKEN→SOL: amount of input token to sell, in raw atomic units. Mutually exclusive with amountSol. */
+  sellAmountAtomic?: bigint;
+};
+
+export type ExecuteTradeResult =
+  | {
+      status: "ok";
+      txid: string;
+      executedPriceSolPerToken: number | null;
+      quote: QuoteResponse;
+    }
+  | {
+      status: "no_token_account";
+      reason: string;
+    };
+
 /**
  * High-level orchestrator: quote → swap → sign → send → confirm.
  * Used by the `submit_trade` tool handler.
  *
- * `executedPriceSolPerToken` is the SOL-side ratio if the trade is
- * SOL→TOKEN; otherwise null. We do NOT fetch token decimals here — Phase 4
- * verification doesn't need it.
+ * Supports both BUY (SOL→TOKEN) and SELL (TOKEN→SOL). For SELL the caller
+ * passes `sellAmountAtomic` (raw atomic uint64 of the input token); we verify
+ * the on-chain ATA exists and holds enough before quoting. Jupiter's
+ * `wrapAndUnwrapSol: true` automatically unwraps WSOL output back to native
+ * SOL — we do not create a close-account instruction ourselves.
+ *
+ * `executedPriceSolPerToken` is reported as SOL-per-atomic-token (matching
+ * the existing ledger convention). Caller can decimals-correct downstream.
  */
-export async function executeTrade(args: {
-  inputMint: string;
-  outputMint: string;
-  amountSol: number;
-  slippageBps: number;
-}): Promise<{ txid: string; executedPriceSolPerToken: number | null; quote: QuoteResponse }> {
+export async function executeTrade(
+  args: ExecuteTradeArgs,
+): Promise<ExecuteTradeResult> {
   const inputMint = resolveMint(args.inputMint);
   const outputMint = resolveMint(args.outputMint);
+  const isSell = inputMint !== SOL_MINT && outputMint === SOL_MINT;
+  const isBuy = inputMint === SOL_MINT && outputMint !== SOL_MINT;
 
-  // Convert SOL → lamports if buying with SOL. For SELL paths the caller is
-  // expected to pass an already-atomic amount via a different code path —
-  // Phase 4 only wires the BUY happy path. SELL gets wired in Phase 5.
-  if (inputMint !== SOL_MINT) {
+  if (!isSell && !isBuy) {
     throw new Error(
-      "executeTrade currently only supports SOL→TOKEN; SELL path lands in Phase 5"
+      `executeTrade only supports SOL↔TOKEN; got inputMint=${inputMint} outputMint=${outputMint}`,
     );
   }
-  const amountLamports = BigInt(Math.round(args.amountSol * 1e9)).toString();
+
+  let amountAtomic: string;
+  if (isBuy) {
+    if (args.amountSol === undefined) {
+      throw new Error("BUY (SOL→TOKEN) requires amountSol");
+    }
+    if (args.sellAmountAtomic !== undefined) {
+      throw new Error("BUY rejects sellAmountAtomic; pass amountSol only");
+    }
+    amountAtomic = BigInt(Math.round(args.amountSol * 1e9)).toString();
+  } else {
+    // isSell
+    if (args.sellAmountAtomic === undefined) {
+      throw new Error("SELL (TOKEN→SOL) requires sellAmountAtomic");
+    }
+    if (args.amountSol !== undefined) {
+      throw new Error("SELL rejects amountSol; pass sellAmountAtomic only");
+    }
+    if (args.sellAmountAtomic <= 0n) {
+      throw new Error("sellAmountAtomic must be > 0");
+    }
+    amountAtomic = args.sellAmountAtomic.toString();
+  }
 
   const rpcUrl = defaultRpcUrl();
   const connection = new Connection(rpcUrl, "confirmed");
   const userPublicKey = getPublicKey();
 
+  if (isSell) {
+    const ownerPk = new PublicKey(userPublicKey);
+    const mintPk = new PublicKey(inputMint);
+    const ata = getAssociatedTokenAddressSync(mintPk, ownerPk);
+    try {
+      const acct = await getAccount(connection, ata);
+      if (acct.amount < args.sellAmountAtomic!) {
+        return {
+          status: "no_token_account",
+          reason: `ATA holds ${acct.amount.toString()} < requested ${args.sellAmountAtomic!.toString()}`,
+        };
+      }
+    } catch (err) {
+      // Token-2022 mints would throw TokenInvalidAccountOwnerError here — flag
+      // up to caller rather than silently retry with wrong program id.
+      if (err instanceof TokenAccountNotFoundError) {
+        return {
+          status: "no_token_account",
+          reason: `no ATA for mint ${inputMint} under owner ${userPublicKey}`,
+        };
+      }
+      throw err;
+    }
+  }
+
   const quote = await getQuote({
     inputMint,
     outputMint,
-    amount: amountLamports,
+    amount: amountAtomic,
     slippageBps: args.slippageBps,
   });
 
   const { swapTransaction } = await submitSwap({ quote, userPublicKey });
   const { txid } = await signAndSend(swapTransaction, connection);
 
-  // SOL/token ratio — we know inAmount is in lamports (1e9 / SOL).
-  // outAmount is in atomic units of the output token (decimals unknown).
-  // The "SOL-side" ratio = SOL / atomic-token. Useful only for relative
-  // comparison across same-token trades. Null if we can't parse.
-  const inLamports = Number(quote.inAmount);
-  const outAtomic = Number(quote.outAmount);
-  const executedPriceSolPerToken =
-    Number.isFinite(inLamports) && Number.isFinite(outAtomic) && outAtomic > 0
-      ? inLamports / 1e9 / outAtomic
-      : null;
+  // For BUY: inAmount = lamports spent, outAmount = atomic tokens received →
+  //   SOL per atomic-token = inLamports/1e9 / outAtomic.
+  // For SELL: inAmount = atomic tokens sold, outAmount = lamports received →
+  //   SOL per atomic-token = outLamports/1e9 / inAtomic.
+  const inAmt = Number(quote.inAmount);
+  const outAmt = Number(quote.outAmount);
+  let executedPriceSolPerToken: number | null = null;
+  if (Number.isFinite(inAmt) && Number.isFinite(outAmt) && inAmt > 0 && outAmt > 0) {
+    executedPriceSolPerToken = isBuy
+      ? inAmt / 1e9 / outAmt
+      : outAmt / 1e9 / inAmt;
+  }
 
-  return { txid, executedPriceSolPerToken, quote };
+  return { status: "ok", txid, executedPriceSolPerToken, quote };
 }

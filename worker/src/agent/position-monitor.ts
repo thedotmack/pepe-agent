@@ -7,13 +7,10 @@
  * sell. We do NOT auto-execute exits — the agent narrates and calls
  * submit_trade so the decision lives in the transcript + memory.
  *
- * CAVEAT — Jupiter execution is BUY-only today:
- *   `worker/src/trade/jupiter.ts:executeTrade()` throws when `inputMint !==
- *   SOL_MINT`. That means an exit prompt from this monitor that triggers
- *   submit_trade(tokenIn=<mint>, tokenOut=SOL) will fail in the handler
- *   with "executeTrade currently only supports SOL→TOKEN; SELL path lands
- *   in Phase 5". The position stays open and the error surfaces to the
- *   agent. SELL wiring is intentionally out of scope for this phase.
+ * SELL path: as of PLAN-real-go-live.md Phase 1, executeTrade supports
+ * TOKEN→SOL. The agent receives an exit prompt from this monitor and calls
+ * submit_trade with side="SELL", tokenIn=<mint>, tokenOut="SOL",
+ * sellAmountTokens=<UI units from get_open_positions>.
  *
  * Refs:
  *   - worker/src/trade/ledger.ts: openPositions() shape (uses

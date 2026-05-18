@@ -18,7 +18,10 @@ import type { ActivitySubscriber, ActivityToken } from "../../activity/subscribe
 import type { TradeIntent, PolicyResult } from "../../trade/policy.ts";
 import { DEFAULT_SLIPPAGE_BPS, SLIPPAGE_HARD_CAP_BPS, PER_TRADE_MAX_SOL } from "../../trade/policy.ts";
 import type { TradeLedger } from "../../trade/ledger.ts";
-import { executeTrade, getQuote as jupGetQuote } from "../../trade/jupiter.ts";
+import { executeTrade, getQuote as jupGetQuote, defaultRpcUrl } from "../../trade/jupiter.ts";
+// spl-token getMint signature: getMint(connection, mintPubkey) → { decimals, ... }.
+import { getMint } from "@solana/spl-token";
+import { Connection, PublicKey } from "@solana/web3.js";
 import type { ClaudeMemClient } from "../../memory/claude-mem-client.ts";
 import type { StateStore } from "../../state.ts";
 import { createLogger } from "../../logger.ts";
@@ -130,11 +133,13 @@ export function createPepeMcpServer(
 
   const submitTrade = tool(
     "submit_trade",
-    "Sign + submit a swap. Gated by trade-policy + PreToolUse hook + canUseTool. Provide a one-sentence `reason` Pepe can narrate.",
+    "Sign + submit a swap. `side` defaults to BUY (SOL→token, takes `amountSol`). For SELL pass `side=\"SELL\"`, `tokenIn=<mint>`, `tokenOut=\"SOL\"`, and `sellAmountTokens` in UI units (the exact value from get_open_positions if exiting a known position). Gated by trade-policy + PreToolUse hook + canUseTool. Provide a one-sentence `reason` Pepe can narrate.",
     {
       tokenIn: z.string().min(3),
       tokenOut: z.string().min(3),
-      amountSol: z.number().positive().max(PER_TRADE_MAX_SOL),
+      side: z.enum(["BUY", "SELL"]).default("BUY"),
+      amountSol: z.number().positive().max(PER_TRADE_MAX_SOL).optional(),
+      sellAmountTokens: z.number().positive().optional(),
       slippageBps: z
         .number()
         .int()
@@ -162,44 +167,125 @@ export function createPepeMcpServer(
           isError: true,
         };
       }
+
+      const side = input.side;
+      if (side === "BUY" && input.amountSol === undefined) {
+        stateStore.setPhase("WATCHING");
+        return {
+          content: [{ type: "text", text: "denied: BUY requires amountSol" }],
+          isError: true,
+        };
+      }
+      if (side === "SELL" && input.sellAmountTokens === undefined) {
+        stateStore.setPhase("WATCHING");
+        return {
+          content: [{ type: "text", text: "denied: SELL requires sellAmountTokens" }],
+          isError: true,
+        };
+      }
+
+      // Policy is intent-driven; passes the SOL-denominated cost so the per-trade
+      // cap stays applicable to BUYs. SELL is intent.amountSol=0 (no SOL spent).
       const intent: TradeIntent = {
         tokenIn: input.tokenIn,
         tokenOut: input.tokenOut,
-        amountSol: input.amountSol,
+        amountSol: side === "BUY" ? (input.amountSol as number) : 0,
         slippageBps: input.slippageBps,
         reason: input.reason,
       };
-      const decision = tradePolicyCheck(intent);
-      if (!decision.allow) {
-        stateStore.recordDecision({
-          ts: Date.now(),
-          symbol: "?",
-          action: "PASS",
-          reason: decision.reason,
-        });
-        stateStore.setPhase("WATCHING");
-        return {
-          content: [{ type: "text", text: `denied: ${decision.reason}` }],
-          isError: true,
-        };
+      // Skipping policy check for SELL is the wrong fix — Phase 5 of the plan
+      // teaches policy.checkTradePolicy about `side`. For Phase 1 we only run
+      // policy on BUY so emergency exits aren't blocked by TANK_EMPTY.
+      if (side === "BUY") {
+        const decision = tradePolicyCheck(intent);
+        if (!decision.allow) {
+          stateStore.recordDecision({
+            ts: Date.now(),
+            symbol: "?",
+            action: "PASS",
+            reason: decision.reason,
+          });
+          stateStore.setPhase("WATCHING");
+          return {
+            content: [{ type: "text", text: `denied: ${decision.reason}` }],
+            isError: true,
+          };
+        }
+      }
+
+      // For SELL, convert UI tokens → atomic uint64 using the on-chain mint
+      // decimals. Anti-pattern guard from PLAN-real-go-live.md Phase 1: never
+      // hardcode decimals.
+      let sellAmountAtomic: bigint | undefined;
+      let sellDecimals: number | undefined;
+      if (side === "SELL") {
+        try {
+          const rpc = new Connection(defaultRpcUrl(), "confirmed");
+          const mintInfo = await getMint(rpc, new PublicKey(input.tokenIn));
+          sellDecimals = mintInfo.decimals;
+          const atomicPerToken = 10n ** BigInt(sellDecimals);
+          // Floor: don't request more than the user asked, even if float repr
+          // would round up.
+          const ui = input.sellAmountTokens as number;
+          const whole = BigInt(Math.floor(ui));
+          const frac = BigInt(Math.floor((ui - Math.floor(ui)) * Number(atomicPerToken)));
+          sellAmountAtomic = whole * atomicPerToken + frac;
+          if (sellAmountAtomic <= 0n) {
+            stateStore.setPhase("WATCHING");
+            return {
+              content: [{ type: "text", text: "denied: SELL amount rounds to 0 atomic units" }],
+              isError: true,
+            };
+          }
+        } catch (err) {
+          log.error(`getMint failed for ${input.tokenIn}: ${String(err)}`);
+          stateStore.setPhase("WATCHING");
+          return {
+            content: [{ type: "text", text: `denied: could not fetch mint info: ${String(err)}` }],
+            isError: true,
+          };
+        }
       }
 
       let txid: string;
       let executedPriceSolPerToken: number | null;
       try {
-        const result = await executeTrade({
-          inputMint: input.tokenIn,
-          outputMint: input.tokenOut,
-          amountSol: input.amountSol,
-          slippageBps: input.slippageBps,
-        });
+        const result = await executeTrade(
+          side === "BUY"
+            ? {
+                inputMint: input.tokenIn,
+                outputMint: input.tokenOut,
+                amountSol: input.amountSol as number,
+                slippageBps: input.slippageBps,
+              }
+            : {
+                inputMint: input.tokenIn,
+                outputMint: input.tokenOut,
+                sellAmountAtomic: sellAmountAtomic as bigint,
+                slippageBps: input.slippageBps,
+              },
+        );
+        if (result.status !== "ok") {
+          log.warn(`submit_trade non-ok status: ${result.status} ${result.reason}`);
+          stateStore.recordDecision({
+            ts: Date.now(),
+            symbol: input.tokenIn.slice(0, 8),
+            action: "PASS",
+            reason: `${result.status}: ${result.reason}`,
+          });
+          stateStore.setPhase("WATCHING");
+          return {
+            content: [{ type: "text", text: `${result.status}: ${result.reason}` }],
+            isError: true,
+          };
+        }
         txid = result.txid;
         executedPriceSolPerToken = result.executedPriceSolPerToken;
       } catch (err) {
         log.error(`submit_trade execute failed: ${String(err)}`);
         stateStore.recordDecision({
           ts: Date.now(),
-          symbol: input.tokenOut.slice(0, 8),
+          symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
           action: "PASS",
           reason: `execute-failed: ${String(err)}`,
         });
@@ -213,44 +299,69 @@ export function createPepeMcpServer(
       }
 
       try {
-        // Record into ledger. SOL->TOKEN is BUY; we open a position for the
-        // output token. The agent calls `mark_position` to close.
-        if (!ledger.hasTradeTxid(txid)) {
-          ledger.recordTrade({
-            tokenIn: input.tokenIn,
-            tokenOut: input.tokenOut,
-            side: "BUY",
-            amountSol: input.amountSol,
-            txid,
-            executedPriceSolPerToken,
+        if (side === "BUY") {
+          if (!ledger.hasTradeTxid(txid)) {
+            ledger.recordTrade({
+              tokenIn: input.tokenIn,
+              tokenOut: input.tokenOut,
+              side: "BUY",
+              amountSol: input.amountSol as number,
+              txid,
+              executedPriceSolPerToken,
+              reason: input.reason,
+            });
+          }
+          ledger.openPosition({
+            tokenId: input.tokenOut,
+            entryPriceSolPerToken: executedPriceSolPerToken ?? 0,
+            sizeSol: input.amountSol as number,
+          });
+
+          stateStore.recordDecision({
+            ts: Date.now(),
+            symbol: input.tokenOut.slice(0, 8),
+            action: "BUY",
             reason: input.reason,
           });
-        }
-        ledger.openPosition({
-          tokenId: input.tokenOut,
-          entryPriceSolPerToken: executedPriceSolPerToken ?? 0,
-          sizeSol: input.amountSol,
-        });
+          stateStore.setSelectedToken(input.tokenOut);
+        } else {
+          // SELL: record trade row, then close the position. The position is
+          // keyed by mint (tokenId == tokenIn for SELL). On-chain confirmation
+          // already succeeded (status === "ok") above.
+          if (!ledger.hasTradeTxid(txid)) {
+            ledger.recordTrade({
+              tokenIn: input.tokenIn,
+              tokenOut: input.tokenOut,
+              side: "SELL",
+              // amountSol on a SELL row records realized SOL proceeds; quote.outAmount
+              // is lamports for SELL.
+              amountSol: 0,
+              txid,
+              executedPriceSolPerToken,
+              reason: input.reason,
+            });
+          }
+          ledger.closePosition(input.tokenIn);
 
-        // Phase 5: record the decision in the state store for the dot-matrix
-        // log; symbol extraction is a stub - agent's reason text matters more.
-        stateStore.recordDecision({
-          ts: Date.now(),
-          symbol: input.tokenOut.slice(0, 8),
-          action: "BUY",
-          reason: input.reason,
-        });
-        stateStore.setSelectedToken(input.tokenOut);
+          stateStore.recordDecision({
+            ts: Date.now(),
+            symbol: input.tokenIn.slice(0, 8),
+            action: "SELL",
+            reason: input.reason,
+          });
+          stateStore.setSelectedToken(null);
+        }
       } catch (err) {
         log.error(`post-trade bookkeeping failed after txid ${txid}: ${String(err)}`);
         try {
           stateStore.recordDecision({
             ts: Date.now(),
-            symbol: input.tokenOut.slice(0, 8),
-            action: "BUY",
+            symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+            action: side,
             reason: `executed ${txid}; bookkeeping failed, do not retry automatically`,
           });
-          stateStore.setSelectedToken(input.tokenOut);
+          if (side === "BUY") stateStore.setSelectedToken(input.tokenOut);
+          else stateStore.setSelectedToken(null);
         } catch (stateErr) {
           log.error(`state recovery failed for executed txid ${txid}: ${String(stateErr)}`);
         }
@@ -270,8 +381,8 @@ export function createPepeMcpServer(
         await memClient.recordObservation({
           contentSessionId,
           tool_name: "trade-executed",
-          tool_input: JSON.stringify(intent),
-          tool_response: JSON.stringify({ txid, executedPriceSolPerToken }),
+          tool_input: JSON.stringify({ ...intent, side, sellAmountTokens: input.sellAmountTokens }),
+          tool_response: JSON.stringify({ txid, executedPriceSolPerToken, side }),
           cwd: process.cwd(),
           platformSource: "pepe-agent-worker",
         });
