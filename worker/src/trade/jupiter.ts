@@ -32,10 +32,14 @@ import { getKeypair, getPublicKey } from "./wallet.ts";
 
 const log = createLogger("trade.jupiter");
 
-/** How long to race confirmTransaction before giving up and polling status. */
-const CONFIRM_TIMEOUT_MS = 90_000;
-/** Interval between rebroadcasts of the signed tx while waiting for confirm. */
-const REBROADCAST_INTERVAL_MS = 2_000;
+/** How long to race confirmTransaction before giving up and polling status.
+ *  Exported (Phase 7 H2) so state.ts can reuse the same constant for the
+ *  TRADING safety timeout, and so jupiter-confirm.test.ts can drive timing
+ *  off the canonical value instead of a hard-coded wall-clock sleep. */
+export const CONFIRM_TIMEOUT_MS = 90_000;
+/** Interval between rebroadcasts of the signed tx while waiting for confirm.
+ *  Exported for the same reason as CONFIRM_TIMEOUT_MS. */
+export const REBROADCAST_INTERVAL_MS = 2_000;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -349,6 +353,16 @@ export type ExecuteTradeResult =
       reason: string;
     }
   | {
+      // Phase 7 H1: distinguished from no_token_account so the handler /
+      // logs / agent prompt can correctly describe the failure (ATA exists
+      // but holds < requested). Carries the exact bigints so a future agent
+      // turn can re-attempt with the available balance instead of guessing.
+      status: "insufficient_token_balance";
+      requested: bigint;
+      available: bigint;
+      reason: string;
+    }
+  | {
       status: "failed_onchain";
       txid: string;
       err: unknown;
@@ -429,8 +443,15 @@ export async function executeTrade(
     try {
       const acct = await getAccount(connection, ata);
       if (acct.amount < args.sellAmountAtomic!) {
+        // Phase 7 H1: ATA exists but doesn't hold enough — this is distinct
+        // from a missing ATA. Distinguishing the two lets the handler
+        // narrate "you don't have X tokens" vs "we never opened a position
+        // here", and lets a future agent prompt re-attempt with the
+        // available amount.
         return {
-          status: "no_token_account",
+          status: "insufficient_token_balance",
+          requested: args.sellAmountAtomic!,
+          available: acct.amount,
           reason: `ATA holds ${acct.amount.toString()} < requested ${args.sellAmountAtomic!.toString()}`,
         };
       }
@@ -471,6 +492,16 @@ export async function executeTrade(
   // math is unit-consistent across the ledger.
   //   BUY:  inAmount = lamports spent,    outAmount = atomic tokens received
   //   SELL: inAmount = atomic tokens sold, outAmount = lamports received
+  //
+  // Phase 7 H6: `10 ** args.decimals` uses JS Number, which is safe up to
+  // Number.MAX_SAFE_INTEGER = 2^53 - 1 ≈ 9.007e15. That comfortably fits
+  // every real-world Solana mint: SPL token-program-v1 stores decimals in
+  // a u8 but in practice no mainnet token exceeds decimals=9 (SOL itself).
+  // Token-2022 also caps decimals at u8 but again real mints stay ≤ 9.
+  // For hypothetical decimals=15 the math is still exact; decimals=16
+  // would lose precision (1e16 = 10_000_000_000_000_000 > 2^53). If we
+  // ever ingest a token with decimals ≥ 16, fall back to BigInt math
+  // here. Tests in jupiter-sell.test.ts pin the precision boundary.
   const inAmt = Number(quote.inAmount);
   const outAmt = Number(quote.outAmount);
   const tokenAtomicPerUi = 10 ** args.decimals;

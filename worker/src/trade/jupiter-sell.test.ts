@@ -45,7 +45,8 @@ class FakeTokenAccountNotFoundError extends Error {
   }
 }
 
-let getAccountBehaviour: "found" | "missing" = "found";
+let getAccountBehaviour: "found" | "missing" | "low_balance" = "found";
+let lowBalanceAmount: bigint = 0n;
 let lastQuoteUrl: string | null = null;
 let lastSwapBody: unknown = null;
 
@@ -54,6 +55,11 @@ mock.module("@solana/spl-token", () => ({
   getAccount: async () => {
     if (getAccountBehaviour === "missing") {
       throw new FakeTokenAccountNotFoundError();
+    }
+    if (getAccountBehaviour === "low_balance") {
+      // Phase 7 H1: ATA exists but holds less than the test's requested
+      // sellAmountAtomic. Used to drive the insufficient_token_balance path.
+      return { amount: lowBalanceAmount };
     }
     return { amount: 10_000_000_000n };
   },
@@ -227,6 +233,27 @@ describe("executeTrade (SELL / TOKEN→SOL)", () => {
     }
   });
 
+  it("returns insufficient_token_balance (distinct variant) when ATA exists but holds less than requested", async () => {
+    // Phase 7 H1: distinguish ATA-missing (no_token_account) from
+    // ATA-exists-but-low (insufficient_token_balance). The variant carries
+    // the exact bigints so the handler can narrate the failure precisely.
+    getAccountBehaviour = "low_balance";
+    lowBalanceAmount = 500n;
+    const result = await executeTrade({
+      inputMint: TOKEN_MINT,
+      outputMint: SOL_MINT,
+      sellAmountAtomic: 1000n,
+      slippageBps: 100,
+      decimals: 6,
+    });
+    expect(result.status).toBe("insufficient_token_balance");
+    if (result.status === "insufficient_token_balance") {
+      expect(result.requested).toBe(1000n);
+      expect(result.available).toBe(500n);
+      expect(result.reason).toMatch(/500.*1000/);
+    }
+  });
+
   it("rejects calls that mix amountSol + sellAmountAtomic", async () => {
     getAccountBehaviour = "found";
     await expect(
@@ -251,5 +278,30 @@ describe("executeTrade (SELL / TOKEN→SOL)", () => {
         decimals: 6,
       }),
     ).rejects.toThrow(/SOL↔TOKEN/);
+  });
+});
+
+describe("executeTrade decimals precision boundary (Phase 7 H6)", () => {
+  // `10 ** args.decimals` uses Number — safe up to ~2^53 ≈ 9.007e15.
+  // Every real Solana mint stays ≤ decimals=9; these tests document the
+  // theoretical safety margin for token-2022 mints that might use higher
+  // decimals. If decimals=16 ever shows up in production, the comment in
+  // jupiter.ts:tokenAtomicPerUi calls for a BigInt rewrite.
+
+  it("decimals=15: 10^15 is still exactly representable as a Number", () => {
+    // 10^15 = 1_000_000_000_000_000 < 2^53 - 1 = 9_007_199_254_740_991.
+    const v = 10 ** 15;
+    expect(Number.isSafeInteger(v)).toBe(true);
+    expect(v).toBe(1_000_000_000_000_000);
+  });
+
+  it("decimals=16: 10^16 exceeds Number.MAX_SAFE_INTEGER (documented limit)", () => {
+    // 10^16 = 10_000_000_000_000_000 > 2^53 - 1.
+    const v = 10 ** 16;
+    expect(Number.isSafeInteger(v)).toBe(false);
+    // Number is still _representable_ (no Infinity) but math beyond this
+    // accumulates rounding. The jupiter.ts comment documents this and
+    // calls for BigInt fallback if a real decimals≥16 token shows up.
+    expect(Number.isFinite(v)).toBe(true);
   });
 });

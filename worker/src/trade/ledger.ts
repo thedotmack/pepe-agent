@@ -35,12 +35,15 @@ export interface TradeLedger {
   hasTradeTxid(txid: string): boolean;
   lastTradeMs(): number | null;
   /**
-   * Telemetry-only since Phase 5. Currently identical to dailyBuySolToday()
-   * because totalTodayStmt filters BUY rows (see SCHEMA / totalTodayStmt
-   * below). Kept as a named method for log lines that say "today's BUY
-   * total"; policy must read dailyBuySolToday() so the intent is explicit.
+   * Phase 7 H7: renamed from `totalSolToday` to match what the SQL actually
+   * returns (BUY-filtered total). The old name lied — it filtered BUY rows
+   * but read like a side-agnostic total. Kept distinct from
+   * dailyBuySolToday only to label intent at the call site:
+   *   - totalBuySolToday() → telemetry / log lines / dashboards
+   *   - dailyBuySolToday() → policy daily cap
+   * Same SQL behind both.
    */
-  totalSolToday(): number;
+  totalBuySolToday(): number;
   /**
    * BUY-only daily SOL deployed. Policy's daily cap reads this so SELL
    * proceeds don't artificially shrink the deployed-capital number; see
@@ -69,6 +72,28 @@ export interface TradeLedger {
    */
   setPositionDecimals(tokenId: string, decimals: number): void;
   closePosition(tokenId: string): void;
+  /**
+   * Phase 7 H4: persist a structured trade-result event. Until this method
+   * existed, state.ts:recordTradeResult silently dropped the meta param
+   * its 13 call-sites already populate with (side, txid, outcome, reason).
+   * Now those fire-and-forget events get a row in `phase_events` so a
+   * human can reconcile against trades.txid + decision-log narration.
+   */
+  recordPhaseEvent(input: {
+    side?: "BUY" | "SELL";
+    txid?: string;
+    outcome?: string;
+    reason: string;
+  }): void;
+  /** Phase 7 H4 helper for tests + offline audit: list events newest-first. */
+  recentPhaseEvents(limit?: number): Array<{
+    id: number;
+    ts: number;
+    side: string | null;
+    txid: string | null;
+    outcome: string | null;
+    reason: string;
+  }>;
   close(): void;
 }
 
@@ -119,8 +144,22 @@ CREATE TABLE IF NOT EXISTS positions (
   closedAt INTEGER,
   decimals INTEGER NOT NULL DEFAULT 9
 );
+-- Phase 7 H4: structured trade-result audit log. Each row is one
+-- recordTradeResult() event from state.ts (denied_policy, ok, failed_onchain,
+-- not_landed, landed_after_timeout, no_token_account). Trade rows in trades
+-- table capture only successful on-chain effects; this table captures every
+-- attempt, including pre-send denials.
+CREATE TABLE IF NOT EXISTS phase_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  side TEXT,
+  txid TEXT,
+  outcome TEXT,
+  reason TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_txid_unique ON trades(txid) WHERE txid IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_phase_events_ts ON phase_events(ts);
 `;
 
 // citation: SQLite ADD COLUMN with DEFAULT backfills existing rows; PRAGMA
@@ -184,6 +223,16 @@ export function openLedger(): TradeLedger {
   const closePositionStmt = db.prepare(
     `UPDATE positions SET closedAt = $closedAt WHERE tokenId = $tokenId AND closedAt IS NULL`
   );
+  const insertPhaseEventStmt = db.prepare(
+    `INSERT INTO phase_events (ts, side, txid, outcome, reason)
+     VALUES ($ts, $side, $txid, $outcome, $reason)`,
+  );
+  const recentPhaseEventsStmt = db.prepare(
+    `SELECT id, ts, side, txid, outcome, reason
+       FROM phase_events
+      ORDER BY id DESC
+      LIMIT $limit`,
+  );
 
   return {
     dbPath,
@@ -208,7 +257,9 @@ export function openLedger(): TradeLedger {
       const row = lastTradeStmt.get() as { lastTs: number | null } | undefined;
       return row?.lastTs ?? null;
     },
-    totalSolToday() {
+    totalBuySolToday() {
+      // Phase 7 H7: renamed from totalSolToday. SQL is unchanged — the
+      // prepared statement filters side='BUY' (see SCHEMA_SQL).
       const since = utcMidnightMs(Date.now());
       const row = totalTodayStmt.get({ $since: since }) as { total: number } | undefined;
       return row?.total ?? 0;
@@ -249,6 +300,25 @@ export function openLedger(): TradeLedger {
         $tokenId: tokenId,
         $closedAt: Date.now(),
       });
+    },
+    recordPhaseEvent(input) {
+      insertPhaseEventStmt.run({
+        $ts: Date.now(),
+        $side: input.side ?? null,
+        $txid: input.txid ?? null,
+        $outcome: input.outcome ?? null,
+        $reason: input.reason,
+      });
+    },
+    recentPhaseEvents(limit = 50) {
+      return recentPhaseEventsStmt.all({ $limit: limit }) as Array<{
+        id: number;
+        ts: number;
+        side: string | null;
+        txid: string | null;
+        outcome: string | null;
+        reason: string;
+      }>;
     },
     close() {
       db.close();

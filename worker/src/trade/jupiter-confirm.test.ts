@@ -169,8 +169,10 @@ beforeAll(() => {
   }) as typeof fetch;
 });
 
-// Import AFTER mocks register.
-const { executeTrade } = await import("./jupiter.ts");
+// Import AFTER mocks register. Phase 7 H2: pull the rebroadcast/timeout
+// constants in too so the rebroadcast-fires test drives timing off the
+// canonical values rather than a hard-coded 2_100ms sleep.
+const { executeTrade, REBROADCAST_INTERVAL_MS, CONFIRM_TIMEOUT_MS } = await import("./jupiter.ts");
 
 function resetRpc() {
   rpc.sendRawTransactionCalls = 0;
@@ -274,12 +276,14 @@ describe("signAndSend confirmation paths (Phase 2)", () => {
 
   it("fires the rebroadcast loop at least once while confirmation is slow", async () => {
     resetRpc();
-    // Delay confirmation past one rebroadcast interval (~2s). To keep the
-    // test wall-clock short, resolve confirmation after ~2.1s — enough for
-    // exactly one rebroadcast tick. The initial send is one call; the loop
-    // adds at least one more before resolution.
+    // Phase 7 H2: hold confirmation just past one rebroadcast interval (so
+    // the loop body's `await sleep(REBROADCAST_INTERVAL_MS)` yields once),
+    // then resolve. Driving timing off the exported constant means the
+    // test self-adjusts if the production interval ever changes — no
+    // dangling 2_100 magic number to drift.
+    const holdMs = REBROADCAST_INTERVAL_MS + 100;
     rpc.confirmResult = async () => {
-      await new Promise((r) => setTimeout(r, 2_100));
+      await new Promise((r) => setTimeout(r, holdMs));
       return { value: { err: null } };
     };
 
@@ -293,5 +297,10 @@ describe("signAndSend confirmation paths (Phase 2)", () => {
     expect(result.status).toBe("ok");
     // Initial send + at least one rebroadcast.
     expect(rpc.sendRawTransactionCalls).toBeGreaterThanOrEqual(2);
+    // The constants are exported (not test-mocked), so the loop genuinely
+    // waited ~REBROADCAST_INTERVAL_MS before its first re-send. Document
+    // that here so the wall-clock cost isn't a mystery to future readers.
+    expect(REBROADCAST_INTERVAL_MS).toBeGreaterThan(0);
+    expect(CONFIRM_TIMEOUT_MS).toBeGreaterThan(REBROADCAST_INTERVAL_MS);
   }, 10_000);
 });

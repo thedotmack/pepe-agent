@@ -1,4 +1,9 @@
 import type { TradeLedger } from "./trade/ledger.ts";
+// Phase 7 H2: import the canonical confirmation timeout instead of
+// duplicating the literal. This is the upper bound on how long a single
+// executeTrade attempt can wait for confirmation before signAndSend
+// returns not_landed / landed_after_timeout.
+import { CONFIRM_TIMEOUT_MS } from "./trade/jupiter.ts";
 
 /**
  * Phase 4 kill switch. Exposes both a boolean for legacy call sites and an
@@ -87,11 +92,9 @@ export interface StateStore {
    * no_token_account). Clears the TRADING phase. Without this the state
    * machine would otherwise stay TRADING until the 90s safety timeout fires.
    *
-   * Phase 5: accepts an optional structured meta payload so call-sites can
-   * communicate side / txid / outcome to whatever downstream decision-log
-   * persistence we wire up later (Phase 7+). The implementation currently
-   * only uses `reason` for phase transitions, but accepting the shape now
-   * means we don't have to chase 13 call-sites again when we wire it.
+   * Phase 7 H4: the meta payload (side/txid/outcome) is now persisted to
+   * the ledger's `phase_events` table via ledger.recordPhaseEvent. Reason
+   * still drives the phase transition; meta drives the audit trail.
    */
   recordTradeResult(
     reason: string,
@@ -125,10 +128,15 @@ const CALLING_GRACE_MS = 2_000;
  * Phase 4: TRADING phase now clears on `recordTradeResult(...)`, not on a
  * timer. This is the safety net only: if a trade handler never calls
  * recordTradeResult (crash mid-handler, await wedged), force WATCHING after
- * 90s so the agent isn't stuck. 90s matches the Jupiter CONFIRM_TIMEOUT_MS
- * upper bound (worker/src/trade/jupiter.ts:36) plus headroom.
+ * the timeout so the agent isn't stuck. 5s of headroom past
+ * CONFIRM_TIMEOUT_MS lets the executeTrade result propagate through the
+ * tools handler (which awaits the result, then synchronously calls
+ * recordTradeResult) BEFORE this backstop fires — otherwise a clean
+ * "not_landed at 90.0s" would race the safety timeout and the recorded
+ * outcome could be lost. Phase 7 H2: imported from jupiter.ts so the two
+ * stay in sync.
  */
-const TRADING_SAFETY_TIMEOUT_MS = 90_000;
+const TRADING_SAFETY_TIMEOUT_MS = CONFIRM_TIMEOUT_MS + 5_000;
 const IDLE_TIMEOUT_MS = 5_000;
 
 export function createStateStore(args: CreateStateStoreArgs): StateStore {
@@ -195,16 +203,33 @@ export function createStateStore(args: CreateStateStoreArgs): StateStore {
   }
 
   function recordTradeResult(
-    _reason: string,
-    _meta?: { side?: "BUY" | "SELL"; txid?: string; outcome?: string },
+    reason: string,
+    meta?: { side?: "BUY" | "SELL"; txid?: string; outcome?: string },
   ): void {
     // Phase 4: trade handler reports completion (any variant). Only clear
     // TRADING — never reach in from outside if we were never in TRADING.
-    // Phase 5: meta is accepted but not yet persisted — see interface JSDoc.
     if (phase === "TRADING") {
       phase = "WATCHING";
       tradingSinceMs = null;
       lastTransitionMs = Date.now();
+    }
+    // Phase 7 H4: persist the structured event. Until now the 13 call-sites
+    // already wrote meta but it landed in `_meta` (silently discarded). The
+    // ledger keeps a phase_events row per attempt — distinct from `trades`
+    // which only records successful on-chain effects. Failures (kill-switch
+    // denials, policy denials, failed_onchain, not_landed) now have a paper
+    // trail that survives across worker restarts.
+    try {
+      ledger.recordPhaseEvent({
+        side: meta?.side,
+        txid: meta?.txid,
+        outcome: meta?.outcome,
+        reason,
+      });
+    } catch {
+      // Audit log must never throw out of a state-transition path; the
+      // handler's primary on-chain work already happened (or didn't) and
+      // recovery happens elsewhere.
     }
   }
 

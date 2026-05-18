@@ -32,7 +32,10 @@ function fakeLedger(state: FakeLedgerState): TradeLedger {
     recordTrade: () => ({ id: 1 }),
     hasTradeTxid: () => false,
     lastTradeMs: () => state.lastTradeMs,
-    totalSolToday: () => state.totalSolToday,
+    // Phase 7 H7: renamed from totalSolToday. The fake field on
+    // FakeLedgerState stays `totalSolToday` (internal test convention) but
+    // the ledger interface method is now `totalBuySolToday`.
+    totalBuySolToday: () => state.totalSolToday,
     // Phase 5: policy reads dailyBuySolToday for the daily cap. We back it
     // by the same fake field — production reads the same SQL row.
     dailyBuySolToday: () => state.totalSolToday,
@@ -48,6 +51,10 @@ function fakeLedger(state: FakeLedgerState): TradeLedger {
     openPosition: () => {},
     setPositionDecimals: () => {},
     closePosition: () => {},
+    // Phase 7 H4: policy never writes to phase_events, so these are inert
+    // for the policy tests. Included to satisfy the TradeLedger interface.
+    recordPhaseEvent: () => {},
+    recentPhaseEvents: () => [],
     close: () => {},
   };
 }

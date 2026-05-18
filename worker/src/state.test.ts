@@ -21,37 +21,72 @@
 import { describe, it, expect } from "bun:test";
 
 // config.ts validates AGENT_SHARED_SECRET at module load — set before import.
+// Phase 7 H2 hazard: static ES imports are hoisted ahead of these assignments,
+// so any module that transitively loads config.ts (e.g. jupiter.ts, which
+// state.ts now depends on) MUST be imported dynamically below.
 process.env.AGENT_SHARED_SECRET = "test-shared-secret-32-chars-min-x";
+process.env.SOLANA_NETWORK = "devnet";
 
-import { createStateStore, createKillSwitchRef } from "./state.ts";
 import type { TradeLedger } from "./trade/ledger.ts";
 
-// Minimal in-memory ledger fake — only openPositions() is read by snapshot.
-function fakeLedger(): TradeLedger {
+// Phase 7 H2: state.ts derives its safety timeout from CONFIRM_TIMEOUT_MS
+// (worker/src/trade/jupiter.ts) + 5s headroom. Both modules trigger
+// config.ts validation at load time, so we dynamic-import them AFTER the
+// process.env assignments above. Mirrors the pattern in
+// jupiter-sell.test.ts / jupiter-confirm.test.ts.
+const { createStateStore, createKillSwitchRef } = await import("./state.ts");
+const { CONFIRM_TIMEOUT_MS } = await import("./trade/jupiter.ts");
+
+// Minimal in-memory ledger fake — captures recordPhaseEvent so the Phase 7
+// H4 test can assert the meta payload landed.
+type PhaseEventRow = {
+  id: number;
+  ts: number;
+  side: string | null;
+  txid: string | null;
+  outcome: string | null;
+  reason: string;
+};
+function fakeLedger(): TradeLedger & { phaseEvents: PhaseEventRow[] } {
+  const phaseEvents: PhaseEventRow[] = [];
+  let nextId = 1;
   return {
     dbPath: ":memory:",
     recordTrade: () => ({ id: 1 }),
     hasTradeTxid: () => false,
     lastTradeMs: () => null,
-    totalSolToday: () => 0,
+    totalBuySolToday: () => 0,
     dailyBuySolToday: () => 0,
     openPositions: () => [],
     openPosition: () => {},
     setPositionDecimals: () => {},
     closePosition: () => {},
+    recordPhaseEvent: (input) => {
+      phaseEvents.push({
+        id: nextId++,
+        ts: Date.now(),
+        side: input.side ?? null,
+        txid: input.txid ?? null,
+        outcome: input.outcome ?? null,
+        reason: input.reason,
+      });
+    },
+    recentPhaseEvents: (limit = 50) => phaseEvents.slice(-limit).reverse(),
     close: () => {},
+    phaseEvents,
   };
 }
 
 function makeStore() {
   const killSwitchRef = createKillSwitchRef({ bootKillSwitchActive: false });
+  const ledger = fakeLedger();
   const store = createStateStore({
-    ledger: fakeLedger(),
+    ledger,
     killSwitchRef,
     contentSessionId: null,
     walletPubkey: null,
   });
-  return { store, killSwitchRef };
+  return { store, killSwitchRef, ledger };
 }
 
 describe("StateStore TRADING phase (Phase 4)", () => {
@@ -79,7 +114,7 @@ describe("StateStore TRADING phase (Phase 4)", () => {
     expect(store.snapshot().phase).toBe("WATCHING");
   });
 
-  it("flips TRADING → WATCHING after the 90s safety timeout (handler wedged)", () => {
+  it("flips TRADING → WATCHING after the safety timeout (handler wedged)", () => {
     const { store } = makeStore();
     // setPhase reads Date.now() internally for tradingSinceMs, so we have
     // to make the synthetic `now` we feed to tick() match real wall-clock
@@ -88,13 +123,50 @@ describe("StateStore TRADING phase (Phase 4)", () => {
     const enteredAt = Date.now();
     store.setPhase("TRADING");
 
-    // Just under 90s — still TRADING.
-    store.tick(enteredAt + 89_000);
+    // Phase 7 H2: TRADING_SAFETY_TIMEOUT_MS = CONFIRM_TIMEOUT_MS + 5_000.
+    // Just under the threshold — still TRADING.
+    const safety = CONFIRM_TIMEOUT_MS + 5_000;
+    store.tick(enteredAt + safety - 1_000);
     expect(store.snapshot().phase).toBe("TRADING");
 
-    // Just over 90s — safety timeout kicks in.
-    store.tick(enteredAt + 90_001);
+    // Just over the threshold — safety timeout kicks in.
+    store.tick(enteredAt + safety + 1);
     expect(store.snapshot().phase).toBe("WATCHING");
+  });
+
+  it("Phase 7 H4: recordTradeResult persists meta to ledger.recordPhaseEvent", () => {
+    const { store, ledger } = makeStore();
+    store.setPhase("TRADING");
+
+    store.recordTradeResult("executed 5xfake", {
+      side: "BUY",
+      txid: "5xfake",
+      outcome: "ok",
+    });
+
+    expect(ledger.phaseEvents.length).toBe(1);
+    const ev = ledger.phaseEvents[0];
+    expect(ev.side).toBe("BUY");
+    expect(ev.txid).toBe("5xfake");
+    expect(ev.outcome).toBe("ok");
+    expect(ev.reason).toBe("executed 5xfake");
+  });
+
+  it("Phase 7 H4: recordTradeResult persists a row even when phase was not TRADING (denial trail)", () => {
+    // Denied trades early-return through recordTradeResult before the phase
+    // ever flipped to TRADING (kill-switch / policy denial). The meta must
+    // still land in phase_events so a human can reconcile every attempt.
+    const { store, ledger } = makeStore();
+    expect(store.snapshot().phase).toBe("IDLE");
+
+    store.recordTradeResult("policy: kill switch tripped", {
+      side: "BUY",
+      outcome: "denied_kill_switch",
+    });
+
+    expect(ledger.phaseEvents.length).toBe(1);
+    expect(ledger.phaseEvents[0].outcome).toBe("denied_kill_switch");
+    expect(ledger.phaseEvents[0].txid).toBeNull();
   });
 
   it("recordTradeResult outside TRADING is a no-op (does not stomp WATCHING/IDLE/CALLING)", () => {

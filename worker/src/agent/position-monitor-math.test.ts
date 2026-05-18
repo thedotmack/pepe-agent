@@ -165,7 +165,7 @@ function fakeLedger(positions: Position[]): TradeLedger & {
     recordTrade: () => ({ id: 1 }),
     hasTradeTxid: () => false,
     lastTradeMs: () => null,
-    totalSolToday: () => 0,
+    totalBuySolToday: () => 0,
     dailyBuySolToday: () => 0,
     openPositions: () => positions,
     openPosition: () => {},
@@ -175,6 +175,10 @@ function fakeLedger(positions: Position[]): TradeLedger & {
       if (row) row.decimals = decimals;
     },
     closePosition: () => {},
+    // Phase 7 H4: position-monitor never writes to phase_events; satisfy
+    // the interface only.
+    recordPhaseEvent: () => {},
+    recentPhaseEvents: () => [],
     close: () => {},
     setDecimalsCalls,
   };

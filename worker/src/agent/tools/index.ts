@@ -53,9 +53,14 @@ function rankToken(t: ActivityToken): number {
   return gain * 1000 + vol / 1_000_000;
 }
 
-export function createPepeMcpServer(
-  args: CreatePepeMcpServerArgs
-): McpSdkServerConfigWithInstance {
+/**
+ * Phase 7 H3: build the raw SdkMcpToolDefinition[] from the same args
+ * shape. Exposed so tests can invoke a tool's `.handler(input, undefined)`
+ * directly without going through the MCP transport layer. Production
+ * boot still wraps these via createSdkMcpServer in createPepeMcpServer
+ * below.
+ */
+export function createPepeTools(args: CreatePepeMcpServerArgs) {
   const {
     subscriber,
     tradePolicyCheck,
@@ -358,6 +363,34 @@ export function createPepeMcpServer(
               isError: true,
             };
           }
+          case "insufficient_token_balance": {
+            // Phase 7 H1: distinct from no_token_account. ATA exists but
+            // holds less than requested. Surface the exact numbers so the
+            // narration is accurate and a future re-attempt can use the
+            // available balance.
+            log.warn(
+              `submit_trade insufficient_token_balance: requested=${result.requested} available=${result.available}`,
+            );
+            stateStore.recordDecision({
+              ts: Date.now(),
+              symbol: input.tokenIn.slice(0, 8),
+              action: "PASS",
+              reason: `insufficient_token_balance: ${result.reason}`,
+            });
+            stateStore.recordTradeResult(
+              `insufficient_token_balance: ${result.reason}`,
+              { side, outcome: "insufficient_token_balance" },
+            );
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `execute-failed: insufficient_token_balance (requested=${result.requested}, available=${result.available})`,
+                },
+              ],
+              isError: true,
+            };
+          }
           case "failed_onchain": {
             log.warn(
               `submit_trade failed_onchain txid=${result.txid} err=${JSON.stringify(result.err)}`,
@@ -626,16 +659,35 @@ export function createPepeMcpServer(
     }
   );
 
+  return {
+    getTopTokens,
+    getOpenPositions,
+    getQuote,
+    submitTrade,
+    markPosition,
+    killSwitch,
+  };
+}
+
+/**
+ * Production entry point — wraps the tool definitions from createPepeTools
+ * in an MCP SDK server config. Tests bypass this wrapper and use the raw
+ * tools directly.
+ */
+export function createPepeMcpServer(
+  args: CreatePepeMcpServerArgs,
+): McpSdkServerConfigWithInstance {
+  const tools = createPepeTools(args);
   return createSdkMcpServer({
     name: "pepe",
     version: "0.1.0",
     tools: [
-      getTopTokens,
-      getOpenPositions,
-      getQuote,
-      submitTrade,
-      markPosition,
-      killSwitch,
+      tools.getTopTokens,
+      tools.getOpenPositions,
+      tools.getQuote,
+      tools.submitTrade,
+      tools.markPosition,
+      tools.killSwitch,
     ],
   });
 }
