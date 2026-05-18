@@ -55,6 +55,11 @@ class FakeVersionedTransaction {
   // signAndSend reads tx.message.recentBlockhash for the confirmation
   // strategy — must be the blockhash signed into the tx.
   message = { recentBlockhash: fakeBlockhash };
+  // Phase 14 P14-T1: signAndSend reads tx.signatures[0] on the initial-send
+  // timeout fallback path to derive the txid client-side via bs58.encode.
+  // Use a deterministic 64-byte all-ones array so the bs58-encoded form is
+  // a known constant the test can assert on.
+  signatures: Uint8Array[] = [new Uint8Array(64).fill(1)];
   static deserialize(_buf: Uint8Array) {
     return new FakeVersionedTransaction();
   }
@@ -84,6 +89,11 @@ class FakePublicKey {
 // behaviour object.
 interface FakeRpcBehaviour {
   sendRawTransactionCalls: number;
+  // Phase 14 P14-T1: sendRawTransactionResult is injectable so the new
+  // initial-send-timeout test can make the first call hang while subsequent
+  // rebroadcasts succeed. Receives the call index so the test can branch
+  // on "is this the initial send (call 0) or a rebroadcast (call ≥ 1)".
+  sendRawTransactionResult: (callIndex: number) => Promise<string>;
   confirmResult: () => Promise<{ value: { err: unknown } }>;
   signatureStatusResult: () => Promise<{
     value: {
@@ -96,6 +106,7 @@ interface FakeRpcBehaviour {
 
 const rpc: FakeRpcBehaviour = {
   sendRawTransactionCalls: 0,
+  sendRawTransactionResult: async () => "fake-txid-confirm",
   confirmResult: async () => ({ value: { err: null } }),
   signatureStatusResult: async () => ({
     value: { err: null, confirmationStatus: "confirmed", slot: 1 },
@@ -105,8 +116,9 @@ const rpc: FakeRpcBehaviour = {
 class FakeConnection {
   constructor(_url: string, _commitment?: string) {}
   async sendRawTransaction() {
+    const callIndex = rpc.sendRawTransactionCalls;
     rpc.sendRawTransactionCalls += 1;
-    return "fake-txid-confirm";
+    return rpc.sendRawTransactionResult(callIndex);
   }
   async confirmTransaction() {
     return rpc.confirmResult();
@@ -199,6 +211,7 @@ const { executeTrade, REBROADCAST_INTERVAL_MS, CONFIRM_TIMEOUT_MS } = await impo
 
 function resetRpc() {
   rpc.sendRawTransactionCalls = 0;
+  rpc.sendRawTransactionResult = async () => "fake-txid-confirm";
   rpc.confirmResult = async () => ({ value: { err: null } });
   rpc.signatureStatusResult = async () => ({
     value: { err: null, confirmationStatus: "confirmed", slot: 1 },
@@ -338,6 +351,80 @@ describe("signAndSend confirmation paths (Phase 2)", () => {
     // No tx ever broadcast — the counter is the load-bearing assertion.
     expect(rpc.sendRawTransactionCalls).toBe(0);
   });
+
+  it("Phase 14 P14-T1: initial sendRawTransaction timeout → derives txid from signed tx; rebroadcast loop races; returns ok", async () => {
+    // Phase 14 P14-C1 wrapped the initial sendRawTransaction with the
+    // withSolanaTimeout 10s ceiling. On timeout the production code:
+    //   1. catches the "timeout after Nms"-shaped error;
+    //   2. derives txid from tx.signatures[0] via bs58.encode (so the
+    //      confirm/poll calls have a real signature to work with);
+    //   3. falls through to the existing confirm/rebroadcast/timeout
+    //      race — bounded by CONFIRM_TIMEOUT_MS — to either land the trade
+    //      or declare not_landed.
+    //
+    // This test pins that contract: make the FIRST sendRawTransaction
+    // call reject with a timeout-shaped error, then make subsequent
+    // rebroadcasts succeed and confirmTransaction succeed. The function
+    // must return status:ok with a non-null txid that matches the
+    // bs58-encoded signature.
+    resetRpc();
+
+    // FakeVersionedTransaction.signatures[0] = new Uint8Array(64).fill(1).
+    // bs58.encode of that array is deterministic — pin it as the expected
+    // txid for the timeout-derived path. We compute it inline so the
+    // assertion isn't dependent on a magic string.
+    const { default: bs58 } = await import("bs58");
+    const expectedDerivedTxid = bs58.encode(new Uint8Array(64).fill(1));
+
+    rpc.sendRawTransactionResult = async (callIndex: number) => {
+      if (callIndex === 0) {
+        // First send: timeout-shaped error so the production catch block
+        // matches /timeout after \d+ms/ and takes the soft-failure
+        // derive-txid branch. We throw immediately (no actual wall-clock
+        // wait) — the withSolanaTimeout race resolves with whichever
+        // promise rejects first, and a synchronous throw beats the 10s
+        // timer.
+        throw new Error(
+          "signAndSend sendRawTransaction (initial) timeout after 10000ms",
+        );
+      }
+      // Subsequent rebroadcasts succeed — simulates the leader eventually
+      // accepting the tx. The signature the network sees matches the
+      // one we derived client-side, so getSignatureStatus would find it.
+      return expectedDerivedTxid;
+    };
+    // Hold confirm just past one rebroadcast interval so the rebroadcast
+    // loop fires at least once (proves the soft-failure path didn't break
+    // the rebroadcast/confirm dance).
+    rpc.confirmResult = async () => {
+      await new Promise((r) => setTimeout(r, REBROADCAST_INTERVAL_MS + 100));
+      return { value: { err: null } };
+    };
+
+    const result = await executeTrade({
+      inputMint: SOL_MINT,
+      outputMint: TOKEN_MINT,
+      amountSol: 0.1,
+      slippageBps: 100,
+      decimals: 6,
+    });
+
+    // The CRITICAL P14-C1 invariants:
+    //   (1) status:ok — initial-send timeout did NOT lose the trade; the
+    //       rebroadcast loop saved it.
+    //   (2) txid === bs58.encode(tx.signatures[0]) — derived client-side
+    //       on the soft-failure path, NOT the value the mock would have
+    //       returned on a successful send. This proves we took the
+    //       timeout-derive branch.
+    //   (3) sendRawTransactionCalls ≥ 2 — initial (failed) + at least one
+    //       rebroadcast. Proves the rebroadcast loop survived the
+    //       initial-send timeout.
+    expect(result.status).toBe("ok");
+    if (result.status === "ok") {
+      expect(result.txid).toBe(expectedDerivedTxid);
+    }
+    expect(rpc.sendRawTransactionCalls).toBeGreaterThanOrEqual(2);
+  }, 10_000);
 
   it("fires the rebroadcast loop at least once while confirmation is slow", async () => {
     resetRpc();

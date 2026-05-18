@@ -911,8 +911,30 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
         };
       }
 
+      // Phase 14 (codex Phase 13 re-audit liveness fix P14-C2): clear the
+      // TRADING phase BEFORE the claude-mem call. Previously the order was
+      //   await memClient.recordObservation(...);   // could hang on mem outage
+      //   stateStore.recordTradeResult(...);        // never reached → TRADING
+      //                                             // phase stuck until 90s
+      //                                             // safety timeout
+      // If claude-mem hangs (network blip, daemon crash, anything), the
+      // recordTradeResult call must still fire so the state machine flips
+      // back to WATCHING promptly. Reordering preserves the "mem call
+      // happens" semantic without making it a blocking hop for state
+      // transitions.
+      //
+      // Phase 4: trade fully resolved (ok or landed_after_timeout). Clear
+      // TRADING phase via recordTradeResult so the state machine flips
+      // back to WATCHING (replaces the old TRADING_HOLD_MS auto-flip).
+      stateStore.recordTradeResult(`executed ${txid}`, {
+        side,
+        txid,
+        outcome: landedLate ? "landed_after_timeout" : "ok",
+      });
+
       // Record the decision in claude-mem so future sessions see it
-      // (plan Phase 4 step 5, line 388).
+      // (plan Phase 4 step 5, line 388). Runs AFTER recordTradeResult per
+      // P14-C2 — mem can hang or fail without blocking phase clearance.
       try {
         await memClient.recordObservation({
           contentSessionId,
@@ -925,15 +947,6 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
       } catch (err) {
         log.warn(`claude-mem record failed (non-fatal): ${String(err)}`);
       }
-
-      // Phase 4: trade fully resolved (ok or landed_after_timeout). Clear
-      // TRADING phase via recordTradeResult so the state machine flips
-      // back to WATCHING (replaces the old TRADING_HOLD_MS auto-flip).
-      stateStore.recordTradeResult(`executed ${txid}`, {
-        side,
-        txid,
-        outcome: landedLate ? "landed_after_timeout" : "ok",
-      });
 
       return {
         content: [{ type: "text", text: `executed ${txid}` }],

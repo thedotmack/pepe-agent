@@ -92,8 +92,15 @@ const mintDecimalsRef = { value: 9 };
 let getAccountImpl: () => Promise<{ amount: bigint }> = async () => ({
   amount: 10_000_000_000n,
 });
+// Phase 14 P14-T1 (codex Phase 13 re-audit re-test of P13-C1): getMintImpl is
+// injectable so the new timeout test can drive the pre-trade getMint into the
+// withRpcTimeout reject branch. Default returns the configured decimals so
+// existing tests continue to exercise the happy path.
+let getMintImpl: () => Promise<{ decimals: number }> = async () => ({
+  decimals: mintDecimalsRef.value,
+});
 mock.module("@solana/spl-token", () => ({
-  getMint: async () => ({ decimals: mintDecimalsRef.value }),
+  getMint: async () => getMintImpl(),
   getAssociatedTokenAddressSync: (mint: unknown) => mint,
   getAccount: async () => getAccountImpl(),
   TokenAccountNotFoundError: class extends Error {},
@@ -377,6 +384,11 @@ beforeEach(() => {
   // without leaking state into other tests. Default = a positive balance
   // that the post-BUY delta math can read.
   getAccountImpl = async () => ({ amount: 10_000_000_000n });
+  // Phase 14 P14-T1: reset getMint behavior to the configured default so
+  // the new timeout test can opt in without leaking state. Default returns
+  // the mintDecimalsRef-configured value (same as the pre-Phase-14 fixed
+  // async did).
+  getMintImpl = async () => ({ decimals: mintDecimalsRef.value });
 });
 
 // ---------- Tests ----------
@@ -744,5 +756,172 @@ describe("submit_trade handler — Phase 7 H5 (float→atomic SELL conversion)",
       /rounds to 0/,
     );
     expect(ledger.trades.length).toBe(0);
+  });
+});
+
+describe("submit_trade handler — Phase 14 P14-T1 (timeout coverage)", () => {
+  // Phase 14 (codex Phase 13 re-audit liveness coverage): pin the behavior
+  // of the timeout-wrapped RPC sites that were previously unbounded. Two
+  // tests live here (handler-layer):
+  //   P13-C1: getMint timeout → handler denies with
+  //           denied_mint_metadata_timeout. Without the withRpcTimeout
+  //           wrap the handler would hang indefinitely on a stuck
+  //           getMint, burning an agent turn on RPC weather.
+  //   P14-C2: memClient.recordObservation hang → recordTradeResult still
+  //           fires (TRADING phase clears) before the mem await.
+  // The two SELL/jupiter-layer tests for P13-C2 and P14-C1 live in
+  // jupiter-sell.test.ts / jupiter-confirm.test.ts respectively, where
+  // the executeTrade flow is exercised end-to-end with Connection mocks.
+
+  it("P14-T1 (P13-C1): getMint timeout → denied_mint_metadata_timeout outcome; no executeTrade call", async () => {
+    // Drive the pre-trade getMint into the withRpcTimeout reject branch by
+    // making getMintImpl throw a "timeout after Nms"-shaped error (the
+    // same shape withRpcTimeout produces in production). The handler
+    // catches this and short-circuits BEFORE executeTrade — the agent
+    // narrates "mint metadata unavailable, retry" and the state machine
+    // records denied_mint_metadata_timeout for /phase-events forensics.
+    getMintImpl = async () => {
+      throw new Error("submit_trade getMint(MintTokenAAAA...) timeout after 10000ms");
+    };
+    let executeCalled = false;
+    executeTradeImpl = async () => {
+      executeCalled = true;
+      throw new Error("executeTrade should not be reached when getMint times out");
+    };
+
+    const { tools, ledger, stateStore } = buildTools();
+    const result = await tools.submitTrade.handler(
+      buyInput({
+        tokenIn: SOL_MINT,
+        tokenOut: TOKEN_MINT,
+        amountSol: 0.1,
+        reason: "RISING signal but getMint is stuck",
+      }),
+      undefined,
+    );
+
+    // CRITICAL invariants: executeTrade NEVER runs, ledger trades stays
+    // empty, and the handler returns isError:true so the agent knows to
+    // retry on the next turn.
+    expect(executeCalled).toBe(false);
+    expect(lastExecuteArgs).toBeNull();
+    expect(ledger.trades.length).toBe(0);
+    expect(ledger.openPositionCalls.length).toBe(0);
+
+    // phase_events captures the structured timeout denial — distinct from
+    // other denial outcomes so postmortem analysis can tell "RPC stalled"
+    // apart from "policy rejected" or "preview quote down".
+    const final = stateStore.tradeResults[stateStore.tradeResults.length - 1];
+    expect(final.outcome).toBe("denied_mint_metadata_timeout");
+    expect(final.side).toBe("BUY");
+    expect(final.reason).toMatch(/timeout after \d+ms/);
+
+    // Tool result surfaces the denial so the agent narrates correctly.
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toMatch(
+      /mint metadata unavailable/i,
+    );
+  });
+
+  it("P14-T1 (P14-C2): claude-mem hang → recordTradeResult still fires before mem await", async () => {
+    // Phase 14 P14-C2 reordered the post-execute bookkeeping so
+    // recordTradeResult fires BEFORE the await memClient.recordObservation
+    // call. Previously a mem hang held TRADING phase set until state.ts's
+    // 90s safety timeout — this test pins the new ordering.
+    //
+    // Approach: wire a custom memClient whose recordObservation never
+    // resolves (hangs forever). The test waits for the swap-success
+    // promise to be in flight, then asserts recordTradeResult already
+    // fired. We can't await the submit_trade handler to completion
+    // because mem is hanging; instead we race the handler against a short
+    // deadline and check the side effect.
+    //
+    // The load-bearing observation is that stateStore.tradeResults has
+    // received the success entry BEFORE the handler returns. Because
+    // recordObservation is awaited LAST, the only way the trade-result
+    // entry is present is if it fired before the await — exactly the
+    // P14-C2 contract.
+    executeTradeImpl = async () => ({
+      status: "ok",
+      txid: "tx-mem-hang",
+      executedPriceSolPerToken: 0.0012,
+      quote: { inAmount: "100000000", outAmount: "5000000" } as never,
+    });
+
+    let memCalled = false;
+    const hangingMemClient: ClaudeMemClient = {
+      baseUrl: "http://test.invalid",
+      health: async () => true,
+      initSession: async () => ({}),
+      recordObservation: async () => {
+        memCalled = true;
+        // Hang forever — simulates a claude-mem daemon crash / network
+        // blackhole where the HTTP request never returns.
+        return await new Promise<never>(() => {});
+      },
+      summarize: async () => ({}),
+      search: async () => ({}),
+    };
+
+    // Custom wiring so we can use the hanging mem client. fakeLedger /
+    // fakeStateStore are reused so we can inspect the side effects.
+    const subscriber = fakeSubscriber();
+    const ledger = fakeLedger();
+    const stateStore = fakeStateStore();
+    const killSwitchRef = fakeKillSwitchRef();
+    const tools = createPepeTools({
+      subscriber,
+      tradePolicyCheck: () => ({ allow: true }),
+      killSwitchRef,
+      ledger,
+      memClient: hangingMemClient,
+      contentSessionId: "test-session",
+      stateStore,
+    });
+
+    // Fire the handler but don't await it — it will hang on the mem
+    // recordObservation call. Race it against a short deadline; we expect
+    // the deadline to win because the handler is stuck on mem.
+    const handlerPromise = tools.submitTrade.handler(
+      buyInput({
+        tokenIn: SOL_MINT,
+        tokenOut: TOKEN_MINT,
+        amountSol: 0.1,
+        reason: "trade succeeds but mem is down",
+      }),
+      undefined,
+    );
+
+    const DEADLINE_SENTINEL = Symbol("deadline");
+    const winner = await Promise.race([
+      handlerPromise.then(() => "handler-returned" as const),
+      new Promise<typeof DEADLINE_SENTINEL>((r) =>
+        setTimeout(() => r(DEADLINE_SENTINEL), 250),
+      ),
+    ]);
+
+    // The handler MUST still be in flight (blocked on mem). If it
+    // returned, the new ordering is wrong (mem must be the LAST hop) or
+    // the hangingMemClient isn't hanging. Either way this assertion fails
+    // loudly.
+    expect(winner).toBe(DEADLINE_SENTINEL);
+    // Mem WAS called — proves we reached the recordObservation line.
+    expect(memCalled).toBe(true);
+
+    // The CRITICAL P14-C2 assertion: recordTradeResult fired BEFORE the
+    // mem hang. Without the reorder, this list would be empty (handler
+    // never reached recordTradeResult because mem swallowed the await).
+    // With the reorder, the success entry is there even though mem is
+    // still hanging.
+    const final = stateStore.tradeResults[stateStore.tradeResults.length - 1];
+    expect(final).toBeDefined();
+    expect(final.outcome).toBe("ok");
+    expect(final.txid).toBe("tx-mem-hang");
+    expect(final.side).toBe("BUY");
+    // TRADING phase must have flipped back to WATCHING via the
+    // recordTradeResult side effect (fakeStateStore mirrors prod behavior:
+    // TRADING → WATCHING on recordTradeResult). If recordTradeResult
+    // hadn't fired, the snapshot phase would still be TRADING.
+    expect(stateStore.snapshot().phase).not.toBe("TRADING");
   });
 });

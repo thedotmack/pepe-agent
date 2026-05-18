@@ -45,7 +45,7 @@ class FakeTokenAccountNotFoundError extends Error {
   }
 }
 
-let getAccountBehaviour: "found" | "missing" | "low_balance" = "found";
+let getAccountBehaviour: "found" | "missing" | "low_balance" | "timeout" = "found";
 let lowBalanceAmount: bigint = 0n;
 let lastQuoteUrl: string | null = null;
 let lastSwapBody: unknown = null;
@@ -60,6 +60,17 @@ mock.module("@solana/spl-token", () => ({
       // Phase 7 H1: ATA exists but holds less than the test's requested
       // sellAmountAtomic. Used to drive the insufficient_token_balance path.
       return { amount: lowBalanceAmount };
+    }
+    if (getAccountBehaviour === "timeout") {
+      // Phase 14 P14-T1 (codex Phase 13 re-audit re-test of P13-C2): simulate
+      // the SELL preflight getAccount hitting the withSolanaTimeout reject
+      // branch. Error shape matches what withSolanaTimeout produces in
+      // production ("<label> timeout after Nms"). executeTrade catches this
+      // via the /timeout after \d+ms/ regex and falls through to
+      // no_token_account with a timeout-flavored reason string.
+      throw new Error(
+        "SELL preflight getAccount(MintInputXXXXXXX...) timeout after 10000ms",
+      );
     }
     return { amount: 10_000_000_000n };
   },
@@ -235,6 +246,37 @@ describe("executeTrade (SELL / TOKEN→SOL)", () => {
     expect(result.status).toBe("no_token_account");
     if (result.status === "no_token_account") {
       expect(result.reason).toMatch(/no ATA/);
+    }
+  });
+
+  it("Phase 14 P14-T1 (P13-C2): SELL preflight getAccount timeout → no_token_account with timeout reason", async () => {
+    // Phase 13 P13-C2 wrapped the SELL preflight getAccount with a 10s
+    // timeout (withSolanaTimeout, formerly withSellPreflightTimeout). The
+    // timeout falls through to the existing no_token_account variant with
+    // a reason string that includes "timeout" — distinguishing "RPC
+    // stalled, retry next turn" from "user has never opened a position
+    // here". This test pins that contract: when getAccount rejects with a
+    // timeout-shaped error, executeTrade must return no_token_account
+    // (not throw), and the reason MUST include "timeout" so /phase-events
+    // postmortem can tell the two failure modes apart.
+    getAccountBehaviour = "timeout";
+
+    const result = await executeTrade({
+      inputMint: TOKEN_MINT,
+      outputMint: SOL_MINT,
+      sellAmountAtomic: 1000n,
+      slippageBps: 100,
+      decimals: 6,
+    });
+
+    // Reuse of the no_token_account variant minimizes churn — the handler
+    // already treats it as retryable, so the agent retries on its next
+    // turn when RPC recovers. The reason string differentiates timeout
+    // from genuinely-missing ATA.
+    expect(result.status).toBe("no_token_account");
+    if (result.status === "no_token_account") {
+      expect(result.reason).toMatch(/timeout/i);
+      expect(result.reason).toMatch(/10000ms/);
     }
   });
 

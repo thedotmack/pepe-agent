@@ -26,6 +26,12 @@ import {
   getAssociatedTokenAddressSync,
   TokenAccountNotFoundError,
 } from "@solana/spl-token";
+// Phase 14 (codex Phase 13 re-audit liveness fix P14-C1): on
+// sendRawTransaction timeout we derive the canonical txid client-side from
+// tx.signatures[0] so the rebroadcast/confirm loop can still race to land
+// the trade. bs58 is already a worker dep (wallet.ts decodes secrets with
+// it) — same encoding the network uses.
+import bs58 from "bs58";
 import { config } from "../config.ts";
 import { createLogger } from "../logger.ts";
 import { getKeypair, getPublicKey } from "./wallet.ts";
@@ -34,27 +40,37 @@ import { getKeypair, getPublicKey } from "./wallet.ts";
 // handler's preview-quote gate was best-effort; this is the structural one.
 // Same module as the preview gate so policy stays single-source-of-truth.
 import { checkRouteLiquidity } from "./policy.ts";
-// Phase 13 (codex Phase 12 re-audit blocker): bound the SELL preflight
-// getAccount with the same 10s ceiling as position-monitor's backfill and
-// tools/index.ts's pre/post-BUY reads. spl-token has no overall-await
-// timeout, so a hung RPC would wedge the SELL path AFTER policy approval
-// but BEFORE we know whether the ATA holds enough. Local re-implementation
-// (rather than `import { withRpcTimeout } from "../agent/position-monitor.ts"`)
-// avoids the circular import — position-monitor.ts already imports
-// defaultRpcUrl + getQuote from this module. Same constant + primitive
-// (AbortSignal.timeout) as the position-monitor helper so an operator only
-// learns one number.
-const SELL_PREFLIGHT_RPC_TIMEOUT_MS = 10_000;
-function withSellPreflightTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+// Phase 13 (codex Phase 12 re-audit blocker) + Phase 14 (codex Phase 13
+// re-audit liveness fix P14-C1): bound EVERY RPC await in this module with
+// the same 10s ceiling as position-monitor's backfill and tools/index.ts's
+// pre/post-BUY reads. spl-token and web3.js have no overall-await timeout
+// at all — a hung RPC would otherwise wedge:
+//   - the SELL preflight (getAccount) after policy approval, before we
+//     know whether the ATA holds enough (Phase 13);
+//   - the initial sendRawTransaction (Phase 14 — soft-failure: the
+//     rebroadcast loop is already bounded by CONFIRM_TIMEOUT_MS so a
+//     timeout here just falls through to that race);
+//   - the two getSignatureStatus polls (Phase 14 — null-result fallback:
+//     timeout is treated as "no status" so the existing not_landed /
+//     landed_after_timeout logic still drives the outcome).
+// Local re-implementation (rather than `import { withRpcTimeout } from
+// "../agent/position-monitor.ts"`) avoids the circular import —
+// position-monitor.ts already imports defaultRpcUrl + getQuote from this
+// module. Renamed from withSellPreflightTimeout to withSolanaTimeout
+// because Phase 14 reuses it across all RPC sites here, not just the SELL
+// preflight. Same constant + primitive (AbortSignal.timeout) as the
+// position-monitor helper so an operator only learns one number.
+const SOLANA_RPC_TIMEOUT_MS = 10_000;
+function withSolanaTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
   return Promise.race([
     operation,
     new Promise<T>((_, reject) => {
-      const signal = AbortSignal.timeout(SELL_PREFLIGHT_RPC_TIMEOUT_MS);
+      const signal = AbortSignal.timeout(SOLANA_RPC_TIMEOUT_MS);
       signal.addEventListener(
         "abort",
         () =>
           reject(
-            new Error(`${label} timeout after ${SELL_PREFLIGHT_RPC_TIMEOUT_MS}ms`),
+            new Error(`${label} timeout after ${SOLANA_RPC_TIMEOUT_MS}ms`),
           ),
         { once: true },
       );
@@ -254,10 +270,49 @@ export async function signAndSend(
     return { status: "not_landed", txid: null, reason: "aborted before send" };
   }
 
-  const txid = await connection.sendRawTransaction(raw, {
-    skipPreflight: true,
-    maxRetries: 0,
-  });
+  // Phase 14 (codex Phase 13 re-audit liveness fix P14-C1): bound the initial
+  // sendRawTransaction with the same 10s ceiling as every other RPC site in
+  // this module. web3.js's sendRawTransaction has no overall-await timeout,
+  // so a hung RPC here would wedge signAndSend BEFORE we ever enter the
+  // confirm/rebroadcast dance — TRADING phase would stay set until state.ts's
+  // 90s safety timeout, and no rebroadcast would fire.
+  // Soft-failure semantics: a sendRawTransaction timeout falls through to
+  // the rebroadcast loop (bounded by CONFIRM_TIMEOUT_MS via its race with
+  // the timeout promise below). The rebroadcast loop keeps retrying the
+  // send while we wait for confirmation, so an initial-send timeout doesn't
+  // necessarily mean the trade is lost — it just means we got no signature
+  // back from the first attempt and rely on the rebroadcast/confirm path
+  // to either land it or declare not_landed.
+  // We need a txid to drive the confirm/poll calls below, so on timeout we
+  // derive it client-side from tx.signatures[0]: VersionedTransaction signs
+  // in place, so signatures[0] is canonical and matches what the network
+  // sees when the rebroadcast eventually lands. bs58-encoded for parity
+  // with the string getSignatureStatus expects.
+  let txid: string;
+  try {
+    txid = await withSolanaTimeout(
+      connection.sendRawTransaction(raw, {
+        skipPreflight: true,
+        maxRetries: 0,
+      }),
+      "signAndSend sendRawTransaction (initial)",
+    );
+  } catch (err) {
+    if (err instanceof Error && /timeout after \d+ms/.test(err.message)) {
+      // Soft failure: derive the txid client-side from the signed tx's
+      // first signature so the rebroadcast/confirm loop can still race to
+      // land it. Once the rebroadcast loop succeeds the network sees this
+      // same signature.
+      const sig = tx.signatures[0];
+      txid = bs58.encode(sig);
+      log.warn(
+        `signAndSend initial sendRawTransaction timed out; derived txid=${txid} from signed tx; ` +
+          `rebroadcast loop will continue (CONFIRM_TIMEOUT_MS bounds the dance)`,
+      );
+    } else {
+      throw err;
+    }
+  }
 
   // If the external signal aborted between send and confirm setup, bail
   // immediately — caller treats not_landed as "we don't know, kill conservatively".
@@ -343,10 +398,18 @@ export async function signAndSend(
     // Sanity reconciliation — confirmTransaction said success, double-check
     // via getSignatureStatus. A null status here is surprising but not
     // fatal; log and accept the confirm verdict.
+    // Phase 14 (codex Phase 13 re-audit liveness fix P14-C1): wrap with the
+    // 10s ceiling. A hung reconciliation RPC must not block the function's
+    // return — the confirm verdict already says "ok" so a timeout here just
+    // means we couldn't double-check; treat as null (logged, accept the
+    // confirm verdict).
     try {
-      const status = await connection.getSignatureStatus(txid, {
-        searchTransactionHistory: true,
-      });
+      const status = await withSolanaTimeout(
+        connection.getSignatureStatus(txid, {
+          searchTransactionHistory: true,
+        }),
+        `signAndSend getSignatureStatus (post-confirm reconcile) for ${txid}`,
+      );
       if (!status.value || !status.value.confirmationStatus) {
         log.warn(
           `tx ${txid} confirmed but getSignatureStatus returned ${JSON.stringify(status.value)}`,
@@ -368,11 +431,21 @@ export async function signAndSend(
   } else {
     log.warn(`confirmTransaction timeout for ${txid} after ${CONFIRM_TIMEOUT_MS}ms; polling status`);
   }
+  // Phase 14 (codex Phase 13 re-audit liveness fix P14-C1): wrap the final
+  // getSignatureStatus poll with the 10s ceiling. A hung RPC here would
+  // wedge signAndSend indefinitely AFTER the confirm/timeout race already
+  // resolved — the worst kind of hang, since the rebroadcast loop has been
+  // aborted and there's nothing else racing. Treat a timeout as null status
+  // (i.e., not_landed), which is identical to the existing "value === null"
+  // branch below.
   let finalStatus: Awaited<ReturnType<Connection["getSignatureStatus"]>>;
   try {
-    finalStatus = await connection.getSignatureStatus(txid, {
-      searchTransactionHistory: true,
-    });
+    finalStatus = await withSolanaTimeout(
+      connection.getSignatureStatus(txid, {
+        searchTransactionHistory: true,
+      }),
+      `signAndSend getSignatureStatus (timeout-fallback poll) for ${txid}`,
+    );
   } catch (err) {
     log.error(`getSignatureStatus poll failed for ${txid}: ${String(err)}`);
     return { status: "not_landed", txid };
@@ -529,7 +602,7 @@ export async function executeTrade(
       // variant churn; the handler already treats it as a retryable
       // failure). The reason string distinguishes "timeout" from "missing"
       // for log/audit purposes.
-      const acct = await withSellPreflightTimeout(
+      const acct = await withSolanaTimeout(
         getAccount(connection, ata),
         `SELL preflight getAccount(${inputMint})`,
       );
