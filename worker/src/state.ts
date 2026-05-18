@@ -1,5 +1,49 @@
 import type { TradeLedger } from "./trade/ledger.ts";
 
+/**
+ * Phase 4 kill switch. Exposes both a boolean for legacy call sites and an
+ * AbortSignal so in-flight Jupiter sends can subscribe and abort the
+ * rebroadcast/confirm loop when /kill fires mid-trade. The signal is
+ * replaced (not un-aborted) on reset() because AbortSignal can't be reused
+ * once aborted.
+ */
+export interface KillSwitchRef {
+  tripped: boolean;
+  /** True if the worker booted with KILL_SWITCH=1 in env. /unkill refuses to
+   *  clear this without an explicit KILL_SWITCH_OVERRIDE=1 confirmation. */
+  bootKillSwitchActive: boolean;
+  /** Aborts the moment trip() is called. Replaced (new signal) on reset(). */
+  signal: AbortSignal;
+  trip(): void;
+  reset(): void;
+}
+
+export function createKillSwitchRef(args: { bootKillSwitchActive: boolean }): KillSwitchRef {
+  // Initial controller. trip() aborts this controller and flips `tripped`.
+  // reset() throws this controller away and installs a new one so future
+  // trades get a fresh, un-aborted signal.
+  let controller = new AbortController();
+  const ref: KillSwitchRef = {
+    tripped: false,
+    bootKillSwitchActive: args.bootKillSwitchActive,
+    signal: controller.signal,
+    trip() {
+      if (this.tripped) return;
+      this.tripped = true;
+      controller.abort();
+    },
+    reset() {
+      this.tripped = false;
+      controller = new AbortController();
+      // Reassign exposed signal so subscribers reading `ref.signal` see the
+      // new (un-aborted) one. Existing listeners on the old signal are dead
+      // weight but harmless — they fire once on its prior abort, if any.
+      this.signal = controller.signal;
+    },
+  };
+  return ref;
+}
+
 export type AgentPhase = "IDLE" | "WATCHING" | "CALLING" | "TRADING";
 
 export type FeedStatus =
@@ -37,13 +81,22 @@ export interface StateStore {
   setFeedStatus(s: FeedStatus): void;
   setSessionId(sessionId: string | null): void;
   recordDecision(entry: DecisionLogEntry): void;
+  /**
+   * Phase 4: called by the trade handler when an executeTrade attempt fully
+   * resolves (ok / failed_onchain / not_landed / landed_after_timeout /
+   * no_token_account). Clears the TRADING phase. Without this the state
+   * machine would otherwise stay TRADING until the 90s safety timeout fires.
+   */
+  recordTradeResult(reason: string): void;
   /** Auto-transition WATCHING/TRADING/CALLING → IDLE based on idle/grace timers. */
   tick(now: number): void;
 }
 
 export interface CreateStateStoreArgs {
   ledger: TradeLedger;
-  killSwitchRef: { tripped: boolean };
+  /** Phase 4: KillSwitchRef now exposes a `signal: AbortSignal` so in-flight
+   *  trades can compose it. Reads still only need `tripped`. */
+  killSwitchRef: Pick<KillSwitchRef, "tripped">;
   contentSessionId: string | null;
   walletPubkey: string | null;
   /**
@@ -55,7 +108,14 @@ export interface CreateStateStoreArgs {
 
 const MAX_DECISION_LOG = 10;
 const CALLING_GRACE_MS = 2_000;
-const TRADING_HOLD_MS = 2_000;
+/**
+ * Phase 4: TRADING phase now clears on `recordTradeResult(...)`, not on a
+ * timer. This is the safety net only: if a trade handler never calls
+ * recordTradeResult (crash mid-handler, await wedged), force WATCHING after
+ * 90s so the agent isn't stuck. 90s matches the Jupiter CONFIRM_TIMEOUT_MS
+ * upper bound (worker/src/trade/jupiter.ts:36) plus headroom.
+ */
+const TRADING_SAFETY_TIMEOUT_MS = 90_000;
 const IDLE_TIMEOUT_MS = 5_000;
 
 export function createStateStore(args: CreateStateStoreArgs): StateStore {
@@ -121,6 +181,16 @@ export function createStateStore(args: CreateStateStoreArgs): StateStore {
     lastTransitionMs = Date.now();
   }
 
+  function recordTradeResult(_reason: string): void {
+    // Phase 4: trade handler reports completion (any variant). Only clear
+    // TRADING — never reach in from outside if we were never in TRADING.
+    if (phase === "TRADING") {
+      phase = "WATCHING";
+      tradingSinceMs = null;
+      lastTransitionMs = Date.now();
+    }
+  }
+
   function tick(now: number): void {
     // CALLING grace timeout: drop back to WATCHING after 2s with no transition.
     if (phase === "CALLING" && callingSinceMs !== null && now - callingSinceMs >= CALLING_GRACE_MS) {
@@ -128,8 +198,16 @@ export function createStateStore(args: CreateStateStoreArgs): StateStore {
       callingSinceMs = null;
       lastTransitionMs = now;
     }
-    // TRADING hold: after 2s flip back to WATCHING.
-    if (phase === "TRADING" && tradingSinceMs !== null && now - tradingSinceMs >= TRADING_HOLD_MS) {
+    // Phase 4: TRADING phase no longer auto-flips on a timer. It clears
+    // ONLY when recordTradeResult fires (handler resolved any variant) or
+    // when the 90s safety timeout fires (handler got stuck/crashed). The
+    // 90s is a backstop, not the primary mechanism. See state.test.ts for
+    // the contract.
+    if (
+      phase === "TRADING" &&
+      tradingSinceMs !== null &&
+      now - tradingSinceMs >= TRADING_SAFETY_TIMEOUT_MS
+    ) {
       phase = "WATCHING";
       tradingSinceMs = null;
       lastTransitionMs = now;
@@ -150,6 +228,7 @@ export function createStateStore(args: CreateStateStoreArgs): StateStore {
     setFeedStatus,
     setSessionId,
     recordDecision,
+    recordTradeResult,
     tick,
   };
 }

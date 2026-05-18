@@ -23,12 +23,16 @@ import { executeTrade, getQuote as jupGetQuote, defaultRpcUrl } from "../../trad
 import { getMint } from "@solana/spl-token";
 import { Connection, PublicKey } from "@solana/web3.js";
 import type { ClaudeMemClient } from "../../memory/claude-mem-client.ts";
-import type { StateStore } from "../../state.ts";
+import type { StateStore, KillSwitchRef as StateKillSwitchRef } from "../../state.ts";
 import { createLogger } from "../../logger.ts";
 
 const log = createLogger("agent.tools");
 
-export type KillSwitchRef = { tripped: boolean };
+// Re-export under the legacy name so loop.ts (which imports KillSwitchRef
+// from this module) keeps working. Phase 4: the shape now exposes
+// `signal: AbortSignal` and `trip()` / `reset()`. Tool handler only reads
+// `tripped` + `signal` — the trip()/reset() side is server-owned.
+export type KillSwitchRef = StateKillSwitchRef;
 
 export interface CreatePepeMcpServerArgs {
   subscriber: ActivitySubscriber;
@@ -161,7 +165,7 @@ export function createPepeMcpServer(
           action: "PASS",
           reason: "kill switch tripped",
         });
-        stateStore.setPhase("WATCHING");
+        stateStore.recordTradeResult("kill switch tripped");
         return {
           content: [{ type: "text", text: "denied: kill switch is tripped" }],
           isError: true,
@@ -170,14 +174,14 @@ export function createPepeMcpServer(
 
       const side = input.side;
       if (side === "BUY" && input.amountSol === undefined) {
-        stateStore.setPhase("WATCHING");
+        stateStore.recordTradeResult("BUY requires amountSol");
         return {
           content: [{ type: "text", text: "denied: BUY requires amountSol" }],
           isError: true,
         };
       }
       if (side === "SELL" && input.sellAmountTokens === undefined) {
-        stateStore.setPhase("WATCHING");
+        stateStore.recordTradeResult("SELL requires sellAmountTokens");
         return {
           content: [{ type: "text", text: "denied: SELL requires sellAmountTokens" }],
           isError: true,
@@ -205,7 +209,7 @@ export function createPepeMcpServer(
             action: "PASS",
             reason: decision.reason,
           });
-          stateStore.setPhase("WATCHING");
+          stateStore.recordTradeResult(`policy: ${decision.reason}`);
           return {
             content: [{ type: "text", text: `denied: ${decision.reason}` }],
             isError: true,
@@ -228,7 +232,7 @@ export function createPepeMcpServer(
         mintDecimals = mintInfo.decimals;
       } catch (err) {
         log.error(`getMint failed for ${side} ${input.tokenIn}→${input.tokenOut}: ${String(err)}`);
-        stateStore.setPhase("WATCHING");
+        stateStore.recordTradeResult(`mint-fetch-failed: ${String(err)}`);
         return {
           content: [{ type: "text", text: `denied: could not fetch mint info: ${String(err)}` }],
           isError: true,
@@ -243,12 +247,31 @@ export function createPepeMcpServer(
         const frac = BigInt(Math.floor((ui - Math.floor(ui)) * Number(atomicPerToken)));
         sellAmountAtomic = whole * atomicPerToken + frac;
         if (sellAmountAtomic <= 0n) {
-          stateStore.setPhase("WATCHING");
+          stateStore.recordTradeResult("SELL amount rounds to 0");
           return {
             content: [{ type: "text", text: "denied: SELL amount rounds to 0 atomic units" }],
             isError: true,
           };
         }
+      }
+
+      // Phase 4: tight kill switch check just before send. The PreToolUse
+      // hook + canUseTool both check kill switch state at decision time, but
+      // a /kill that races between those gates and this line would otherwise
+      // slip through. Cheap to re-check; expensive to be wrong.
+      if (killSwitchRef.tripped) {
+        log.warn("submit_trade aborted pre-send: kill switch tripped mid-trade");
+        stateStore.recordDecision({
+          ts: Date.now(),
+          symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+          action: "PASS",
+          reason: "kill switch tripped mid-trade (pre-send)",
+        });
+        stateStore.recordTradeResult("kill switch tripped mid-trade (pre-send)");
+        return {
+          content: [{ type: "text", text: "denied: kill switch tripped mid-trade" }],
+          isError: true,
+        };
       }
 
       let txid: string;
@@ -258,6 +281,9 @@ export function createPepeMcpServer(
       // the late-landing in the reason for downstream reconciliation.
       let landedLate = false;
       try {
+        // Phase 4: thread killSwitchRef.signal as externalSignal so a /kill
+        // during the rebroadcast/confirm loop aborts the loop, signAndSend
+        // returns not_landed, and we report execute-failed below.
         const result = await executeTrade(
           side === "BUY"
             ? {
@@ -266,6 +292,7 @@ export function createPepeMcpServer(
                 amountSol: input.amountSol as number,
                 slippageBps: input.slippageBps,
                 decimals: mintDecimals as number,
+                externalSignal: killSwitchRef.signal,
               }
             : {
                 inputMint: input.tokenIn,
@@ -273,6 +300,7 @@ export function createPepeMcpServer(
                 sellAmountAtomic: sellAmountAtomic as bigint,
                 slippageBps: input.slippageBps,
                 decimals: mintDecimals as number,
+                externalSignal: killSwitchRef.signal,
               },
         );
         switch (result.status) {
@@ -299,7 +327,7 @@ export function createPepeMcpServer(
               action: "PASS",
               reason: `no_token_account: ${result.reason}`,
             });
-            stateStore.setPhase("WATCHING");
+            stateStore.recordTradeResult(`no_token_account: ${result.reason}`);
             return {
               content: [
                 { type: "text", text: `execute-failed: no_token_account: ${result.reason}` },
@@ -317,7 +345,7 @@ export function createPepeMcpServer(
               action: "PASS",
               reason: `failed_onchain ${result.txid}: ${JSON.stringify(result.err)}`,
             });
-            stateStore.setPhase("WATCHING");
+            stateStore.recordTradeResult(`failed_onchain ${result.txid}`);
             return {
               content: [
                 {
@@ -336,7 +364,7 @@ export function createPepeMcpServer(
               action: "PASS",
               reason: `not_landed ${result.txid}`,
             });
-            stateStore.setPhase("WATCHING");
+            stateStore.recordTradeResult(`not_landed ${result.txid}`);
             return {
               content: [
                 {
@@ -347,6 +375,15 @@ export function createPepeMcpServer(
               isError: true,
             };
           }
+          default: {
+            // Phase 4: exhaustiveness — any new ExecuteTradeResult variant
+            // becomes a compile error here, so failure paths can't be
+            // silently added without updating the handler.
+            const _exhaustive: never = result;
+            throw new Error(
+              `unhandled ExecuteTradeResult variant: ${JSON.stringify(_exhaustive)}`,
+            );
+          }
         }
       } catch (err) {
         log.error(`submit_trade execute failed: ${String(err)}`);
@@ -356,7 +393,7 @@ export function createPepeMcpServer(
           action: "PASS",
           reason: `execute-failed: ${String(err)}`,
         });
-        stateStore.setPhase("WATCHING");
+        stateStore.recordTradeResult(`execute-failed: ${String(err)}`);
         return {
           content: [
             { type: "text", text: `execute-failed: ${String(err)}` },
@@ -437,6 +474,7 @@ export function createPepeMcpServer(
           });
           if (side === "BUY") stateStore.setSelectedToken(input.tokenOut);
           else stateStore.setSelectedToken(null);
+          stateStore.recordTradeResult(`bookkeeping-failed ${txid}`);
         } catch (stateErr) {
           log.error(`state recovery failed for executed txid ${txid}: ${String(stateErr)}`);
         }
@@ -464,6 +502,11 @@ export function createPepeMcpServer(
       } catch (err) {
         log.warn(`claude-mem record failed (non-fatal): ${String(err)}`);
       }
+
+      // Phase 4: trade fully resolved (ok or landed_after_timeout). Clear
+      // TRADING phase via recordTradeResult so the state machine flips
+      // back to WATCHING (replaces the old TRADING_HOLD_MS auto-flip).
+      stateStore.recordTradeResult(`executed ${txid}`);
 
       return {
         content: [{ type: "text", text: `executed ${txid}` }],
@@ -527,7 +570,9 @@ export function createPepeMcpServer(
       reason: z.string().min(4),
     },
     async ({ reason }) => {
-      killSwitchRef.tripped = true;
+      // Phase 4: trip() also aborts the kill-switch AbortSignal so an in-
+      // flight signAndSend rebroadcast loop exits.
+      killSwitchRef.trip();
       log.warn(`kill switch tripped: ${reason}`);
       return {
         content: [

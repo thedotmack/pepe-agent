@@ -212,6 +212,7 @@ function fakeStateStore(phase: "IDLE" | "WATCHING" | "CALLING" | "TRADING"): Sta
     setFeedStatus: () => {},
     setSessionId: () => {},
     recordDecision: () => {},
+    recordTradeResult: () => {},
     tick: () => {},
   };
 }

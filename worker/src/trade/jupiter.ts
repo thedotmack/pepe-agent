@@ -154,6 +154,7 @@ export async function signAndSend(
   swapTransactionBase64: string,
   connection: Connection,
   lastValidBlockHeight: number,
+  externalSignal?: AbortSignal,
 ): Promise<SignAndSendResult> {
   const keypair = getKeypair();
   const buf = Buffer.from(swapTransactionBase64, "base64");
@@ -164,12 +165,37 @@ export async function signAndSend(
   // strategy. NEVER fetch a fresh one here, that defeats the expiry mechanism.
   const blockhash = tx.message.recentBlockhash;
 
+  // Phase 4: an external abort (kill switch tripped mid-trade) must short-
+  // circuit the rebroadcast/confirm loop. Compose the external signal into
+  // the internal AbortController BEFORE send so a pre-aborted external
+  // signal still aborts the internal one.
+  // citation: AbortSignal composition pattern — listen on the external
+  // signal and forward .abort() to the internal controller, { once: true }
+  // so we don't leak listeners if the loop ends first.
+  const abortController = new AbortController();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      abortController.abort();
+    } else {
+      externalSignal.addEventListener(
+        "abort",
+        () => abortController.abort(),
+        { once: true },
+      );
+    }
+  }
+
   const txid = await connection.sendRawTransaction(raw, {
     skipPreflight: true,
     maxRetries: 0,
   });
 
-  const abortController = new AbortController();
+  // If the external signal aborted between send and confirm setup, bail
+  // immediately — caller treats not_landed as "we don't know, kill conservatively".
+  if (abortController.signal.aborted) {
+    return { status: "not_landed", txid };
+  }
+
   const confirmPromise = connection.confirmTransaction(
     {
       signature: txid,
@@ -228,6 +254,15 @@ export async function signAndSend(
     rebroadcastPromise.catch((err) => {
       log.warn(`rebroadcast loop errored: ${String(err)}`);
     });
+  }
+
+  // External abort (kill switch mid-trade): we don't know whether the tx
+  // landed. Conservative answer is "not_landed" — caller treats as failure
+  // and reports execute-failed; if the tx did land, ledger reconciliation
+  // catches it later.
+  if (externalSignal?.aborted) {
+    log.warn(`tx ${txid} signAndSend aborted via externalSignal (kill switch?)`);
+    return { status: "not_landed", txid };
   }
 
   if (confirmOutcome.kind === "resolved") {
@@ -296,6 +331,10 @@ export type ExecuteTradeArgs = {
   /** Decimals of the non-SOL token in the pair. Required so executedPriceSolPerToken
    *  is reported in SOL-per-UI-token (matching position-monitor's price units). */
   decimals: number;
+  /** Phase 4: external abort signal (e.g. wired to killSwitchRef). When this
+   *  aborts mid-trade the rebroadcast/confirm loop exits and signAndSend
+   *  returns `not_landed`. Treats kill-mid-trade as conservative failure. */
+  externalSignal?: AbortSignal;
 };
 
 export type ExecuteTradeResult =
@@ -419,7 +458,12 @@ export async function executeTrade(
     quote,
     userPublicKey,
   });
-  const sendResult = await signAndSend(swapTransaction, connection, lastValidBlockHeight);
+  const sendResult = await signAndSend(
+    swapTransaction,
+    connection,
+    lastValidBlockHeight,
+    args.externalSignal,
+  );
 
   // SOL per UI-token (Phase 3): divide lamports → SOL (÷ 1e9) and divide
   // atomic-token amounts → UI tokens (÷ 10^decimals) before taking the ratio.

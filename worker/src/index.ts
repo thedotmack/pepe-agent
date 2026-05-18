@@ -11,7 +11,7 @@ import { startAutoTick } from "./agent/auto-tick.ts";
 import { startPositionMonitor } from "./agent/position-monitor.ts";
 import { openLedger } from "./trade/ledger.ts";
 import { tryGetPublicKey } from "./trade/wallet.ts";
-import { createStateStore, type FeedStatus } from "./state.ts";
+import { createStateStore, createKillSwitchRef, type FeedStatus } from "./state.ts";
 import type { SubscriberStatus } from "./activity/subscriber.ts";
 
 const log = createLogger("boot");
@@ -41,10 +41,15 @@ async function main() {
 
   // Phase 5: kill switch + state store (created up front so the worker server
   // can serve /state and /kill from boot, even before the agent loop starts).
-  const killSwitchRef = { tripped: false };
-  if (process.env.KILL_SWITCH === "1") {
-    killSwitchRef.tripped = true;
-    log.warn("KILL_SWITCH=1 — trades will be denied");
+  // Phase 4: killSwitchRef now exposes a `signal: AbortSignal` that aborts
+  // when `trip()` is called. In-flight Jupiter sends compose this into their
+  // signAndSend loop so /kill mid-trade actually interrupts the rebroadcast/
+  // confirm dance instead of just being advisory after the fact.
+  const bootKillSwitchActive = process.env.KILL_SWITCH === "1";
+  const killSwitchRef = createKillSwitchRef({ bootKillSwitchActive });
+  if (bootKillSwitchActive) {
+    killSwitchRef.trip();
+    log.warn("KILL_SWITCH=1 — trades will be denied (boot-time)");
   }
 
   // Phase 4: wallet-balance poll. Cached outer variable updated every 15s

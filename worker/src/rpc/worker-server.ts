@@ -3,7 +3,7 @@ import { serve } from "@hono/node-server";
 import { config } from "../config.ts";
 import { createLogger } from "../logger.ts";
 import { tryGetPublicKey } from "../trade/wallet.ts";
-import type { StateStore } from "../state.ts";
+import type { StateStore, KillSwitchRef } from "../state.ts";
 import type { AgentLoopHandle } from "../agent/loop.ts";
 import { createChatStream } from "./chat-stream.ts";
 
@@ -16,7 +16,7 @@ export interface WorkerServerHandle {
 
 export interface StartWorkerServerArgs {
   stateStore: StateStore;
-  killSwitchRef: { tripped: boolean };
+  killSwitchRef: KillSwitchRef;
   /** Agent loop handle, or null if the worker booted without ANTHROPIC_API_KEY. */
   agent: AgentLoopHandle | null;
 }
@@ -86,7 +86,7 @@ export function startWorkerServer(args: StartWorkerServerArgs): WorkerServerHand
 
   app.post("/kill", (c) => {
     log.warn("kill switch tripped via /kill");
-    killSwitchRef.tripped = true;
+    killSwitchRef.trip();
     stateStore.recordDecision({
       ts: Date.now(),
       symbol: "-",
@@ -96,9 +96,32 @@ export function startWorkerServer(args: StartWorkerServerArgs): WorkerServerHand
     return c.json({ killed: true });
   });
 
+  // Phase 4: /unkill is double-gated.
+  //   1. ?confirm=<AGENT_SHARED_SECRET> query param (defeats accidental curl
+  //      replays even if the x-agent-secret header leaks via a log snippet).
+  //   2. If the worker booted with KILL_SWITCH=1, additionally require
+  //      KILL_SWITCH_OVERRIDE=1 in env — operator must explicitly opt out of
+  //      the boot-time safety. /unkill without override refuses.
   app.post("/unkill", (c) => {
+    const confirm = c.req.query("confirm");
+    if (confirm !== config.AGENT_SHARED_SECRET) {
+      log.warn("/unkill denied — missing or wrong ?confirm token");
+      return c.json({ error: "unkill requires ?confirm=<AGENT_SHARED_SECRET>" }, 403);
+    }
+    if (killSwitchRef.bootKillSwitchActive && process.env.KILL_SWITCH_OVERRIDE !== "1") {
+      log.warn(
+        "/unkill denied — worker booted with KILL_SWITCH=1; KILL_SWITCH_OVERRIDE=1 required",
+      );
+      return c.json(
+        {
+          error:
+            "worker booted with KILL_SWITCH=1; set KILL_SWITCH_OVERRIDE=1 in env to allow /unkill",
+        },
+        403,
+      );
+    }
     log.warn("kill switch reset via /unkill");
-    killSwitchRef.tripped = false;
+    killSwitchRef.reset();
     stateStore.recordDecision({
       ts: Date.now(),
       symbol: "-",

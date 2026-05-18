@@ -51,15 +51,15 @@ export function startAutoTick(args: CreateAutoTickArgs): AutoTickHandle {
   const decisionMs = args.decisionIntervalMs ?? 45_000;
   const topN = args.topN ?? 5;
 
-  // Track turn-idle via the loop's emitter so we never stomp on an
-  // in-flight tool call. `assistantText` flips us busy; `result` flips us
-  // idle again. We start optimistic — first tick after boot may push.
+  // Phase 4: turnIdle is now flipped to `false` AT INJECTION TIME so we
+  // never push a second context/decision turn while the previous injection
+  // is still being processed by the SDK. assistantText is an unreliable
+  // trigger because the agent may go through tool calls before emitting
+  // text — between inject and first token, the 15s push could fire again.
+  // Set false on inject; set true only on `result` (turn fully ended).
   let turnIdle = true;
   args.agent.emitter.on("result", () => {
     turnIdle = true;
-  });
-  args.agent.emitter.on("assistantText", () => {
-    turnIdle = false;
   });
 
   let lastDecisionAt = 0;
@@ -111,6 +111,11 @@ export function startAutoTick(args: CreateAutoTickArgs): AutoTickHandle {
       })),
     });
 
+    // Phase 4: flip turnIdle=false BEFORE the inject lands. The SDK may
+    // take several seconds to start emitting tokens; in the meantime the
+    // next pushInterval tick must NOT inject again. `result` (turn fully
+    // ended) is the only event that flips us back to idle.
+    turnIdle = false;
     args.agent.injectActivityContext(`<market_snapshot>${context}</market_snapshot>`);
     log.debug(
       `pushed market snapshot (${candidates.length} candidates, market=${market})`,
@@ -119,6 +124,10 @@ export function startAutoTick(args: CreateAutoTickArgs): AutoTickHandle {
     const now = Date.now();
     if (now - lastDecisionAt >= decisionMs && candidates.length > 0) {
       lastDecisionAt = now;
+      // Decision injection also marks the turn busy — even though we just
+      // set turnIdle=false above for the snapshot, doing it again here
+      // documents that EVERY inject site is responsible for the flip.
+      turnIdle = false;
       args.agent.injectUserMessage(
         "Market check. Based on the latest <market_snapshot> above and your memory:\n" +
           "- If any candidate meets your thesis bar, narrate your call and submit_trade.\n" +
