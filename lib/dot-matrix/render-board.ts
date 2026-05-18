@@ -43,7 +43,12 @@ export type RenderBoardOptions = {
   transcript?: string | null;
   /** Animation phase 0..1 — used to pulse the beam. */
   beamPhase?: number;
-  walletSol?: number;
+  /**
+   * Phase 8 (O3): widened to nullable. `null` means the worker hasn't fetched
+   * a balance yet (RPC down, never configured) — render as "--.-- SOL"
+   * instead of a misleading 0.0000.
+   */
+  walletSol?: number | null;
   pnlUsd?: number;
   layout?: "mobile" | "desktop";
   chat?: ChatLogEntry[];
@@ -175,7 +180,14 @@ function formatTime(value: number | string | undefined): string {
   return `${total}S`;
 }
 
-function formatSol(value: number): string {
+/**
+ * Phase 8 (O3): renders the SOL balance string.
+ * `null` / `undefined` → "--.--" (UNKNOWN, RPC down or not configured).
+ * Non-finite numbers → "0.00" (legacy fallback for NaN/Infinity).
+ * Finite numbers → "1.23" (2 decimal places).
+ */
+function formatSol(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "--.--";
   if (!isFinite(value)) return "0.00";
   return value.toFixed(2);
 }
@@ -323,7 +335,10 @@ function renderMobile(rows: ActivityToken[], opts: RenderBoardOptions): RenderBo
     active: agentPhaseM === "CALLING" || agentPhaseM === "TRADING" || killM,
     width: 21,
   });
-  drawText(m, `${formatSol(opts.walletSol ?? 4.21)} SOL`, 5, 16, {
+  // Phase 8 (O3): drop the demo fallback (`?? 4.21`). formatSol now renders
+  // null/undefined as "--.--" — that's the UNKNOWN state. A real fresh page
+  // with no walletSol prop will show "--.-- SOL" until state hydrates.
+  drawText(m, `${formatSol(opts.walletSol)} SOL`, 5, 16, {
     font: "sm",
     tone: "white",
     level: 0.78,
@@ -630,7 +645,10 @@ function renderDesktop(rows: ActivityToken[], opts: RenderBoardOptions): RenderB
   drawPanel(m, 4, 22, 140, 162, { tone: "blue", level: 0.4 });
 
   // Wallet + PnL header inside the panel
-  drawText(m, `${formatSol(opts.walletSol ?? 4.21)} SOL`, 10, 26, {
+  // Phase 8 (O3): drop the demo fallback (`?? 4.21`). formatSol now renders
+  // null/undefined as "--.--" — that's the UNKNOWN state. A real fresh page
+  // with no walletSol prop will show "--.-- SOL" until state hydrates.
+  drawText(m, `${formatSol(opts.walletSol)} SOL`, 10, 26, {
     font: "sm",
     tone: "white",
     level: 0.86,

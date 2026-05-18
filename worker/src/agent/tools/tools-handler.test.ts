@@ -153,7 +153,6 @@ function fakeLedger(): CapturedLedger {
     },
     hasTradeTxid: (txid) => trades.some((t) => t.txid === txid),
     lastTradeMs: () => null,
-    totalBuySolToday: () => 0,
     dailyBuySolToday: () => 0,
     openPositions: () => [],
     openPosition: (input) => {

@@ -5,6 +5,7 @@ import { createLogger } from "../logger.ts";
 import { tryGetPublicKey } from "../trade/wallet.ts";
 import type { StateStore, KillSwitchRef } from "../state.ts";
 import type { AgentLoopHandle } from "../agent/loop.ts";
+import type { TradeLedger } from "../trade/ledger.ts";
 import { createChatStream } from "./chat-stream.ts";
 
 const log = createLogger("rpc");
@@ -19,10 +20,18 @@ export interface StartWorkerServerArgs {
   killSwitchRef: KillSwitchRef;
   /** Agent loop handle, or null if the worker booted without ANTHROPIC_API_KEY. */
   agent: AgentLoopHandle | null;
+  /**
+   * Phase 8 (O4): ledger handle so the /phase-events endpoint can read the
+   * audit trail. The ledger's recentPhaseEvents() is the source-of-truth
+   * for trade-result attempts (kill-switch denials, policy denials,
+   * failed_onchain, not_landed, etc — anything that flowed through
+   * state.ts:recordTradeResult since Phase 7).
+   */
+  ledger: TradeLedger;
 }
 
 export function startWorkerServer(args: StartWorkerServerArgs): WorkerServerHandle {
-  const { stateStore, killSwitchRef, agent } = args;
+  const { stateStore, killSwitchRef, agent, ledger } = args;
   const startedAt = Date.now();
   const walletPubkey = tryGetPublicKey();
   const app = new Hono();
@@ -49,6 +58,29 @@ export function startWorkerServer(args: StartWorkerServerArgs): WorkerServerHand
 
   // Phase 5: real state machine snapshot.
   app.get("/state", (c) => c.json(stateStore.snapshot()));
+
+  // Phase 8 (O4): audit-trail read API. Returns the N newest phase_events
+  // rows (Phase 7 H4 audit table). Default 50, max 500. Same x-agent-secret
+  // gate as everything else. Use this to reconcile against trades.txid +
+  // decision-log narration on the operator side. Never proxied to browser.
+  app.get("/phase-events", (c) => {
+    const limitParam = c.req.query("limit");
+    let limit = 50;
+    if (limitParam !== undefined) {
+      const parsed = Number(limitParam);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        return c.json({ error: "limit must be a positive integer" }, 400);
+      }
+      limit = Math.min(500, Math.floor(parsed));
+    }
+    try {
+      const events = ledger.recentPhaseEvents(limit);
+      return c.json({ events, limit });
+    } catch (err) {
+      log.warn(`/phase-events read failed: ${String(err)}`);
+      return c.json({ error: "ledger read failed" }, 500);
+    }
+  });
 
   app.post("/chat", async (c) => {
     if (!agent) {

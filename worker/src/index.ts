@@ -113,10 +113,12 @@ async function main() {
     killSwitchRef,
     contentSessionId: null,
     walletPubkey: walletPubkey ?? null,
-    // UI surface: 0 sentinel preserves legacy snapshot behavior when balance
-    // is UNKNOWN. The policy gate uses the nullable accessor (below) so it
-    // can distinguish UNKNOWN from a real low-SOL reading. Audit finding #9.
-    balanceProvider: () => walletSolCached ?? 0,
+    // UI surface: now passes the nullable balance through to the UI so the
+    // board can render UNKNOWN as "--.-- SOL" instead of misleading 0.0000.
+    // The policy gate consumes the same source via the loop's
+    // getWalletSolBalance closure (also nullable). Audit finding #9, Phase
+    // 8 (O3) widens the snapshot surface to match the policy surface.
+    balanceProvider: () => walletSolCached,
   });
 
   // claude-mem client. Health-check on boot but never crash if it's down —
@@ -210,7 +212,7 @@ async function main() {
   // Worker HTTP server (must be started AFTER the agent loop is created so
   // POST /chat can inject into the live query session). When agent is null
   // the server still serves /state, /healthz, /kill — /chat returns 503.
-  const server = startWorkerServer({ stateStore, killSwitchRef, agent });
+  const server = startWorkerServer({ stateStore, killSwitchRef, agent, ledger });
 
   const shutdown = async (signal: string) => {
     log.warn(`received ${signal}, shutting down`);

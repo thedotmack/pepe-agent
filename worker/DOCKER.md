@@ -23,7 +23,7 @@ The image bundles:
 
 ```bash
 # from repo root
-export AGENT_SHARED_SECRET=$(openssl rand -hex 24)
+export AGENT_SHARED_SECRET=$(openssl rand -hex 32)
 export ANTHROPIC_API_KEY=sk-ant-...
 docker compose up -d worker
 docker compose logs -f worker

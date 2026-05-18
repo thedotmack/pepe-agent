@@ -69,7 +69,14 @@ export interface AgentStateSnapshot {
   phase: AgentPhase;
   selectedTokenId: string | null;
   callingSinceMs: number | null;
-  walletSol: number;
+  /**
+   * SOL balance. `null` means UNKNOWN (RPC down on boot or not configured).
+   * Phase 8 (O3): the UI renders `null` as "--.-- SOL" instead of "0.0000",
+   * which was misleading — a real 0 balance is indistinguishable from RPC
+   * down. The audit (Phase 6) made the policy gate already distinguish
+   * UNKNOWN from low-numeric; this exposes that surface to the board.
+   */
+  walletSol: number | null;
   pnlUsd: number;
   openPositions: number;
   killSwitch: boolean;
@@ -116,10 +123,13 @@ export interface CreateStateStoreArgs {
   contentSessionId: string | null;
   walletPubkey: string | null;
   /**
-   * Optional accessor returning the live SOL balance. When omitted, snapshot
-   * reports `walletSol: 0` (legacy behavior).
+   * Optional accessor returning the live SOL balance. Returns `null` when
+   * UNKNOWN (RPC down, never fetched, etc). When the accessor itself is
+   * omitted, snapshot reports `walletSol: null` (UNKNOWN — same surface).
+   * Phase 8 (O3): widened return type from `number` to `number | null` to
+   * match the nullable surface in AgentStateSnapshot.
    */
-  balanceProvider?: () => number;
+  balanceProvider?: () => number | null;
 }
 
 const MAX_DECISION_LOG = 10;
@@ -156,7 +166,10 @@ export function createStateStore(args: CreateStateStoreArgs): StateStore {
       phase,
       selectedTokenId,
       callingSinceMs,
-      walletSol: balanceProvider?.() ?? 0,
+      // Phase 8 (O3): pass the nullable balance through verbatim. The UI
+      // distinguishes null (UNKNOWN) from low/zero numerics. The legacy
+      // `?? 0` coercion silently hid RPC-down at the UI surface.
+      walletSol: balanceProvider?.() ?? null,
       pnlUsd: 0,
       openPositions: ledger.openPositions().length,
       killSwitch: killSwitchRef.tripped,

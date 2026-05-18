@@ -1,5 +1,34 @@
 # PLAN — Pepe Goes Live (autonomous trading on 1 SOL)
 
+> **Phase 8 audit-fix update (2026-05-18):** This document was the ORIGINAL go-live
+> plan. It was followed end-to-end. After Phases 1–6 shipped, an adversarial audit
+> (Codex/Gemini, May 18) surfaced **12 critical findings** that this plan either
+> missed or under-specified. The fixes ship as a separate orchestrated effort in
+> [`PLAN-real-go-live.md`](./PLAN-real-go-live.md) (9 phases, Phases 1–7 already
+> shipped at d6b72cf → 96ef6ba; Phase 8 = devnet smoke + this doc sync; Phase 9 =
+> final verification gate). Headline corrections:
+>
+> - **SELL execution was a stub.** Phase 1 of `PLAN-real-go-live.md` (commit d6b72cf)
+>   wired the real SELL path through `jupiter.ts`. The position monitor's "submit a
+>   sell now" prompt in Phase 3 below assumed an implementation that didn't exist.
+>   It now does.
+> - **Triple-gate defense-in-depth was overstated.** All three policy gates
+>   (PreToolUse hook, canUseTool, handler) call the same `checkTradePolicy()` —
+>   they share fate. Phase 5 of `PLAN-real-go-live.md` (commit 52d584e) added
+>   BUY-vs-SELL discrimination so emergency exits aren't blocked by buy-side caps.
+> - **`walletSol: 0` was a fail-open.** Phase 6 of `PLAN-real-go-live.md`
+>   (commit 0279d79) made the balance accessor `number | null` so RPC-down
+>   reads as UNKNOWN (denies BUYs) instead of `0` (which the policy treated as
+>   "no balance, deny" only by accident — a Connection-down state would
+>   previously have silently coerced to `0`).
+> - **`KILL_SWITCH=1` boot was not sticky.** Phase 4 of `PLAN-real-go-live.md`
+>   (commit efaaf04) added `KILL_SWITCH_OVERRIDE=1` semantics + AbortSignal
+>   threading so /kill mid-trade actually cancels rebroadcast.
+>
+> Mainnet launch is conditional on Phase 7 tests green + Phase 8 devnet smoke
+> clean (`.scratch/devnet-smoke-runbook.md`) + Phase 9 sign-off. See
+> [`worker/PRELAUNCH.md`](./worker/PRELAUNCH.md) for the operator checklist.
+
 **Goal:** Pepe trades real Solana memecoins, autonomously, on live `wss://api.memedeck.win/activity` data, with a 1 SOL float, visible in the browser at `localhost:3010`. The dot-matrix board reflects truth from the worker; trades fire when the agent's thesis matches the BRIEF's rule set; caps + kill switch hold.
 
 **Status of repo (confirmed by file reads, May 17 2026):**
@@ -31,7 +60,7 @@ Six phases, each self-contained. Phases 0–2 ship infra; Phase 3 is "go live."
 |---|---|---|
 | Boot order | `worker/src/index.ts` | Subscriber → memory tick → state tick → agent loop → HTTP server |
 | Agent loop public surface | `worker/src/agent/loop.ts:55-67` (`AgentLoopHandle`) | `injectUserMessage`, `injectActivityContext (shouldQuery:false)`, `stop`, `emitter`, `getQueryHandle` |
-| MCP tool surface | `worker/src/agent/tools/index.ts` | 6 tools, `submit_trade` triple-gated |
+| MCP tool surface | `worker/src/agent/tools/index.ts` | 6 tools, `submit_trade` gated. **Phase 8 note:** the "triple-gated" framing (PreToolUse hook + canUseTool + handler-internal policy check) overstates defense-in-depth — all three gates call the same `checkTradePolicy()` function, so a bug in policy.ts is a single point of failure. The gates are real but they share fate. See `PLAN-real-go-live.md` Phase 5 for the SELL-vs-BUY policy split that fixes the most pressing under-specification. |
 | State store API | `worker/src/state.ts:34-48` (`StateStore` iface) | `setPhase`, `setSelectedToken`, `setFeedStatus`, `recordDecision`, `tick(now)` |
 | Trade policy | `worker/src/trade/policy.ts` | Caps: `PER_TRADE_MAX_SOL=0.25`, `DAILY_MAX_SOL=2.0`, `COOLDOWN_MS=30_000`, `MAX_OPEN_POSITIONS=5`, `SLIPPAGE_HARD_CAP_BPS=300` |
 | Jupiter integration | `worker/src/trade/jupiter.ts` | `getQuote()`, `executeTrade()` — sign+send local, fail-loud |

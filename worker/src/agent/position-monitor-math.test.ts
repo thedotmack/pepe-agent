@@ -165,7 +165,6 @@ function fakeLedger(positions: Position[]): TradeLedger & {
     recordTrade: () => ({ id: 1 }),
     hasTradeTxid: () => false,
     lastTradeMs: () => null,
-    totalBuySolToday: () => 0,
     dailyBuySolToday: () => 0,
     openPositions: () => positions,
     openPosition: () => {},

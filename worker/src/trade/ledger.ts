@@ -35,19 +35,14 @@ export interface TradeLedger {
   hasTradeTxid(txid: string): boolean;
   lastTradeMs(): number | null;
   /**
-   * Phase 7 H7: renamed from `totalSolToday` to match what the SQL actually
-   * returns (BUY-filtered total). The old name lied — it filtered BUY rows
-   * but read like a side-agnostic total. Kept distinct from
-   * dailyBuySolToday only to label intent at the call site:
-   *   - totalBuySolToday() → telemetry / log lines / dashboards
-   *   - dailyBuySolToday() → policy daily cap
-   * Same SQL behind both.
-   */
-  totalBuySolToday(): number;
-  /**
    * BUY-only daily SOL deployed. Policy's daily cap reads this so SELL
    * proceeds don't artificially shrink the deployed-capital number; see
    * policy.ts daily-cap section.
+   *
+   * Phase 8 (O5): the redundant `totalBuySolToday()` method was deleted —
+   * zero production callers and the SQL behind both methods was identical.
+   * The remaining test fixtures kept the legacy stub for hand-built
+   * FakeLedger objects; those are scrubbed in this phase too.
    */
   dailyBuySolToday(): number;
   openPositions(): Array<{
@@ -256,13 +251,6 @@ export function openLedger(): TradeLedger {
     lastTradeMs() {
       const row = lastTradeStmt.get() as { lastTs: number | null } | undefined;
       return row?.lastTs ?? null;
-    },
-    totalBuySolToday() {
-      // Phase 7 H7: renamed from totalSolToday. SQL is unchanged — the
-      // prepared statement filters side='BUY' (see SCHEMA_SQL).
-      const since = utcMidnightMs(Date.now());
-      const row = totalTodayStmt.get({ $since: since }) as { total: number } | undefined;
-      return row?.total ?? 0;
     },
     dailyBuySolToday() {
       // Re-uses totalTodayStmt because the statement already filters

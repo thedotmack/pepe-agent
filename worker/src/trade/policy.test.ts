@@ -32,12 +32,11 @@ function fakeLedger(state: FakeLedgerState): TradeLedger {
     recordTrade: () => ({ id: 1 }),
     hasTradeTxid: () => false,
     lastTradeMs: () => state.lastTradeMs,
-    // Phase 7 H7: renamed from totalSolToday. The fake field on
-    // FakeLedgerState stays `totalSolToday` (internal test convention) but
-    // the ledger interface method is now `totalBuySolToday`.
-    totalBuySolToday: () => state.totalSolToday,
-    // Phase 5: policy reads dailyBuySolToday for the daily cap. We back it
-    // by the same fake field — production reads the same SQL row.
+    // Phase 5: policy reads dailyBuySolToday for the daily cap. The internal
+    // fake field is still named `totalSolToday` (test-only convention).
+    // Phase 8 (O5): the legacy `totalBuySolToday` ledger method was deleted
+    // — zero production callers, identical SQL to dailyBuySolToday. This
+    // fake no longer needs to stub the redundant method.
     dailyBuySolToday: () => state.totalSolToday,
     openPositions: () =>
       Array.from({ length: state.openPositionsCount }, (_, i) => ({
@@ -92,7 +91,11 @@ function ctx(overrides: Partial<PolicyContext> & { state?: Partial<FakeLedgerSta
     // Phase 6: default to a healthy balance so existing BUY tests stay
     // green. Tests that exercise UNKNOWN or TANK_EMPTY behavior override
     // this explicitly. Audit finding #9.
-    walletSolBalance: () => 1.5,
+    // Phase 8 (O6): derive the default from TANK_EMPTY_THRESHOLD_SOL so a
+    // future tweak to the tank-empty floor doesn't leave this stranded at
+    // 1.5 with no apparent connection. 30× threshold = 1.5 SOL = healthy
+    // by any reasonable definition.
+    walletSolBalance: () => TANK_EMPTY_THRESHOLD_SOL * 30,
     ...overrides,
   };
 }

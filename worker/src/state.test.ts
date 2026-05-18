@@ -55,7 +55,6 @@ function fakeLedger(): TradeLedger & { phaseEvents: PhaseEventRow[] } {
     recordTrade: () => ({ id: 1 }),
     hasTradeTxid: () => false,
     lastTradeMs: () => null,
-    totalBuySolToday: () => 0,
     dailyBuySolToday: () => 0,
     openPositions: () => [],
     openPosition: () => {},
