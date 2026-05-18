@@ -34,7 +34,19 @@ export interface TradeLedger {
   }): { id: number };
   hasTradeTxid(txid: string): boolean;
   lastTradeMs(): number | null;
+  /**
+   * Telemetry-only since Phase 5. Currently identical to dailyBuySolToday()
+   * because totalTodayStmt filters BUY rows (see SCHEMA / totalTodayStmt
+   * below). Kept as a named method for log lines that say "today's BUY
+   * total"; policy must read dailyBuySolToday() so the intent is explicit.
+   */
   totalSolToday(): number;
+  /**
+   * BUY-only daily SOL deployed. Policy's daily cap reads this so SELL
+   * proceeds don't artificially shrink the deployed-capital number; see
+   * policy.ts daily-cap section.
+   */
+  dailyBuySolToday(): number;
   openPositions(): Array<{
     tokenId: string;
     symbol: string | null;
@@ -197,6 +209,14 @@ export function openLedger(): TradeLedger {
       return row?.lastTs ?? null;
     },
     totalSolToday() {
+      const since = utcMidnightMs(Date.now());
+      const row = totalTodayStmt.get({ $since: since }) as { total: number } | undefined;
+      return row?.total ?? 0;
+    },
+    dailyBuySolToday() {
+      // Re-uses totalTodayStmt because the statement already filters
+      // side='BUY' (see SCHEMA_SQL above). Same window, same source —
+      // keeping the methods distinct documents intent at the policy layer.
       const since = utcMidnightMs(Date.now());
       const row = totalTodayStmt.get({ $since: since }) as { total: number } | undefined;
       return row?.total ?? 0;

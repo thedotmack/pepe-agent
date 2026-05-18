@@ -156,6 +156,8 @@ export function createPepeMcpServer(
       // Phase 5: flash dot-matrix during the attempt — flip BEFORE policy check.
       stateStore.setPhase("TRADING");
 
+      const side = input.side;
+
       // Defense-in-depth: even if hook + canUseTool somehow let this through,
       // the handler re-checks the policy.
       if (killSwitchRef.tripped) {
@@ -165,56 +167,65 @@ export function createPepeMcpServer(
           action: "PASS",
           reason: "kill switch tripped",
         });
-        stateStore.recordTradeResult("kill switch tripped");
+        stateStore.recordTradeResult("kill switch tripped", {
+          side,
+          outcome: "denied_kill_switch",
+        });
         return {
           content: [{ type: "text", text: "denied: kill switch is tripped" }],
           isError: true,
         };
       }
 
-      const side = input.side;
       if (side === "BUY" && input.amountSol === undefined) {
-        stateStore.recordTradeResult("BUY requires amountSol");
+        stateStore.recordTradeResult("BUY requires amountSol", {
+          side,
+          outcome: "denied_missing_amount",
+        });
         return {
           content: [{ type: "text", text: "denied: BUY requires amountSol" }],
           isError: true,
         };
       }
       if (side === "SELL" && input.sellAmountTokens === undefined) {
-        stateStore.recordTradeResult("SELL requires sellAmountTokens");
+        stateStore.recordTradeResult("SELL requires sellAmountTokens", {
+          side,
+          outcome: "denied_missing_amount",
+        });
         return {
           content: [{ type: "text", text: "denied: SELL requires sellAmountTokens" }],
           isError: true,
         };
       }
 
-      // Policy is intent-driven; passes the SOL-denominated cost so the per-trade
-      // cap stays applicable to BUYs. SELL is intent.amountSol=0 (no SOL spent).
+      // Phase 5: TradeIntent now carries `side` so checkTradePolicy can
+      // apply BUY-only gates (TANK_EMPTY, per-trade cap, daily cap) without
+      // a handler-side carve-out. SELL intent has amountSol=0 by convention
+      // (a SELL produces SOL; it doesn't consume it) — policy ignores it.
       const intent: TradeIntent = {
+        side,
         tokenIn: input.tokenIn,
         tokenOut: input.tokenOut,
         amountSol: side === "BUY" ? (input.amountSol as number) : 0,
         slippageBps: input.slippageBps,
         reason: input.reason,
       };
-      // Skipping policy check for SELL is the wrong fix — Phase 5 of the plan
-      // teaches policy.checkTradePolicy about `side`. For Phase 1 we only run
-      // policy on BUY so emergency exits aren't blocked by TANK_EMPTY.
-      if (side === "BUY") {
-        const decision = tradePolicyCheck(intent);
-        if (!decision.allow) {
-          stateStore.recordDecision({
-            ts: Date.now(),
-            symbol: "?",
-            action: "PASS",
-            reason: decision.reason,
-          });
-          stateStore.recordTradeResult(`policy: ${decision.reason}`);
-          return {
-            content: [{ type: "text", text: `denied: ${decision.reason}` }],
-            isError: true,
-          };
-        }
+      const decision = tradePolicyCheck(intent);
+      if (!decision.allow) {
+        stateStore.recordDecision({
+          ts: Date.now(),
+          symbol: "?",
+          action: "PASS",
+          reason: decision.reason,
+        });
+        stateStore.recordTradeResult(`policy: ${decision.reason}`, {
+          side,
+          outcome: "denied_policy",
+        });
+        return {
+          content: [{ type: "text", text: `denied: ${decision.reason}` }],
+          isError: true,
+        };
       }
 
       // Both BUY and SELL need mint decimals: BUY persists them on the
@@ -232,7 +243,10 @@ export function createPepeMcpServer(
         mintDecimals = mintInfo.decimals;
       } catch (err) {
         log.error(`getMint failed for ${side} ${input.tokenIn}→${input.tokenOut}: ${String(err)}`);
-        stateStore.recordTradeResult(`mint-fetch-failed: ${String(err)}`);
+        stateStore.recordTradeResult(`mint-fetch-failed: ${String(err)}`, {
+          side,
+          outcome: "mint_fetch_failed",
+        });
         return {
           content: [{ type: "text", text: `denied: could not fetch mint info: ${String(err)}` }],
           isError: true,
@@ -247,7 +261,10 @@ export function createPepeMcpServer(
         const frac = BigInt(Math.floor((ui - Math.floor(ui)) * Number(atomicPerToken)));
         sellAmountAtomic = whole * atomicPerToken + frac;
         if (sellAmountAtomic <= 0n) {
-          stateStore.recordTradeResult("SELL amount rounds to 0");
+          stateStore.recordTradeResult("SELL amount rounds to 0", {
+            side,
+            outcome: "denied_zero_amount",
+          });
           return {
             content: [{ type: "text", text: "denied: SELL amount rounds to 0 atomic units" }],
             isError: true,
@@ -267,7 +284,10 @@ export function createPepeMcpServer(
           action: "PASS",
           reason: "kill switch tripped mid-trade (pre-send)",
         });
-        stateStore.recordTradeResult("kill switch tripped mid-trade (pre-send)");
+        stateStore.recordTradeResult("kill switch tripped mid-trade (pre-send)", {
+          side,
+          outcome: "denied_kill_switch_mid",
+        });
         return {
           content: [{ type: "text", text: "denied: kill switch tripped mid-trade" }],
           isError: true,
@@ -327,7 +347,10 @@ export function createPepeMcpServer(
               action: "PASS",
               reason: `no_token_account: ${result.reason}`,
             });
-            stateStore.recordTradeResult(`no_token_account: ${result.reason}`);
+            stateStore.recordTradeResult(`no_token_account: ${result.reason}`, {
+              side,
+              outcome: "no_token_account",
+            });
             return {
               content: [
                 { type: "text", text: `execute-failed: no_token_account: ${result.reason}` },
@@ -345,7 +368,11 @@ export function createPepeMcpServer(
               action: "PASS",
               reason: `failed_onchain ${result.txid}: ${JSON.stringify(result.err)}`,
             });
-            stateStore.recordTradeResult(`failed_onchain ${result.txid}`);
+            stateStore.recordTradeResult(`failed_onchain ${result.txid}`, {
+              side,
+              txid: result.txid,
+              outcome: "failed_onchain",
+            });
             return {
               content: [
                 {
@@ -364,7 +391,11 @@ export function createPepeMcpServer(
               action: "PASS",
               reason: `not_landed ${result.txid}`,
             });
-            stateStore.recordTradeResult(`not_landed ${result.txid}`);
+            stateStore.recordTradeResult(`not_landed ${result.txid}`, {
+              side,
+              txid: result.txid,
+              outcome: "not_landed",
+            });
             return {
               content: [
                 {
@@ -393,7 +424,10 @@ export function createPepeMcpServer(
           action: "PASS",
           reason: `execute-failed: ${String(err)}`,
         });
-        stateStore.recordTradeResult(`execute-failed: ${String(err)}`);
+        stateStore.recordTradeResult(`execute-failed: ${String(err)}`, {
+          side,
+          outcome: "execute_threw",
+        });
         return {
           content: [
             { type: "text", text: `execute-failed: ${String(err)}` },
@@ -474,7 +508,11 @@ export function createPepeMcpServer(
           });
           if (side === "BUY") stateStore.setSelectedToken(input.tokenOut);
           else stateStore.setSelectedToken(null);
-          stateStore.recordTradeResult(`bookkeeping-failed ${txid}`);
+          stateStore.recordTradeResult(`bookkeeping-failed ${txid}`, {
+            side,
+            txid,
+            outcome: "bookkeeping_failed",
+          });
         } catch (stateErr) {
           log.error(`state recovery failed for executed txid ${txid}: ${String(stateErr)}`);
         }
@@ -506,7 +544,11 @@ export function createPepeMcpServer(
       // Phase 4: trade fully resolved (ok or landed_after_timeout). Clear
       // TRADING phase via recordTradeResult so the state machine flips
       // back to WATCHING (replaces the old TRADING_HOLD_MS auto-flip).
-      stateStore.recordTradeResult(`executed ${txid}`);
+      stateStore.recordTradeResult(`executed ${txid}`, {
+        side,
+        txid,
+        outcome: landedLate ? "landed_after_timeout" : "ok",
+      });
 
       return {
         content: [{ type: "text", text: `executed ${txid}` }],
@@ -548,15 +590,17 @@ export function createPepeMcpServer(
           isError: true,
         };
       }
-      // Manual entry path — we don't fetch decimals here. Use SOL's 9 as a
-      // conservative bootstrap; position-monitor will lazy-fetch + backfill
-      // via setPositionDecimals on first tick if this is wrong.
+      // Manual entry path — we don't fetch decimals here. Use 0 (sentinel)
+      // so position-monitor's lazy-backfill (`!Number.isFinite || <= 0`)
+      // triggers on the first tick and writes the correct mint decimals via
+      // setPositionDecimals. A default of 9 (SOL) would silently bypass
+      // backfill and corrupt the unit math for any non-9-decimal token.
       ledger.openPosition({
         tokenId,
         symbol,
         entryPriceSolPerToken,
         sizeSol,
-        decimals: 9,
+        decimals: 0,
       });
       stateStore.setSelectedToken(tokenId);
       return { content: [{ type: "text", text: `opened ${tokenId} (${reason})` }] };

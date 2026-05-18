@@ -17,7 +17,22 @@
  */
 import type { TradeLedger } from "./ledger.ts";
 
+/**
+ * A normalized trade intent passed to checkTradePolicy.
+ *
+ * Field semantics by side (Phase 5 — side-aware policy):
+ *   BUY:  tokenIn = SOL_MINT (or "SOL"), tokenOut = mint being bought,
+ *         amountSol = SOL spent (positive).
+ *   SELL: tokenIn = mint being sold, tokenOut = SOL_MINT (or "SOL"),
+ *         amountSol = 0 (a SELL produces SOL; it doesn't consume it). The
+ *         per-trade SOL cap and daily BUY cap don't apply on SELL.
+ *
+ * Adding `side` removes the structural lie from the old shape, where SELL
+ * call-sites had to fake amountSol=0 and reverse in/out without anything in
+ * the type telling the policy which direction this trade goes.
+ */
 export type TradeIntent = {
+  side: "BUY" | "SELL";
   tokenIn: string;
   tokenOut: string;
   amountSol: number;
@@ -70,21 +85,30 @@ export function checkTradePolicy(
       reason: "no wallet configured (set AGENT_WALLET_PRIVATE_KEY_BASE58)",
     };
   }
+  // TANK-EMPTY gates BUYs only. SELLs are emergency exits — the whole
+  // point of selling at low SOL is to recover SOL. Audit finding #4
+  // (PLAN-real-go-live.md Phase 5).
   const walletSolBalance = ctx.walletSolBalance ?? (() => Infinity);
-  if (walletSolBalance() < TANK_EMPTY_THRESHOLD_SOL) {
+  if (intent.side === "BUY" && walletSolBalance() < TANK_EMPTY_THRESHOLD_SOL) {
     return {
       allow: false,
       reason: `TANK EMPTY (wallet < ${TANK_EMPTY_THRESHOLD_SOL} SOL)`,
     };
   }
-  if (!Number.isFinite(intent.amountSol) || intent.amountSol <= 0) {
-    return { allow: false, reason: "amountSol must be > 0" };
-  }
-  if (intent.amountSol > PER_TRADE_MAX_SOL) {
-    return {
-      allow: false,
-      reason: `per-trade cap ${PER_TRADE_MAX_SOL} SOL exceeded (got ${intent.amountSol})`,
-    };
+  // amountSol / per-trade cap apply to BUYs only. SELL doesn't consume SOL
+  // (it produces it), and the position size was already capped at entry,
+  // so a SELL is not bounded by PER_TRADE_MAX_SOL. amountSol on a SELL
+  // intent is 0 by convention; we don't reject it.
+  if (intent.side === "BUY") {
+    if (!Number.isFinite(intent.amountSol) || intent.amountSol <= 0) {
+      return { allow: false, reason: "amountSol must be > 0" };
+    }
+    if (intent.amountSol > PER_TRADE_MAX_SOL) {
+      return {
+        allow: false,
+        reason: `per-trade cap ${PER_TRADE_MAX_SOL} SOL exceeded (got ${intent.amountSol})`,
+      };
+    }
   }
   if (intent.slippageBps > SLIPPAGE_HARD_CAP_BPS) {
     return {
@@ -108,14 +132,20 @@ export function checkTradePolicy(
     }
   }
 
-  const todayTotal = ctx.ledger.totalSolToday();
-  if (todayTotal + intent.amountSol > DAILY_MAX_SOL) {
-    return {
-      allow: false,
-      reason: `daily cap ${DAILY_MAX_SOL} SOL would be exceeded (today=${todayTotal.toFixed(
-        3
-      )}, new=${intent.amountSol})`,
-    };
+  // Daily cap is a *capital-deployment* cap, not a churn cap. It must count
+  // BUY SOL only — netting SELLs in would let a wash-trade pattern (sell $X,
+  // buy $X) understate daily exposure and slip past the cap. SELLs are
+  // unbounded by the daily cap; their notional was bounded at entry.
+  if (intent.side === "BUY") {
+    const todayBuyTotal = ctx.ledger.dailyBuySolToday();
+    if (todayBuyTotal + intent.amountSol > DAILY_MAX_SOL) {
+      return {
+        allow: false,
+        reason: `daily cap ${DAILY_MAX_SOL} SOL would be exceeded (today=${todayBuyTotal.toFixed(
+          3
+        )}, new=${intent.amountSol})`,
+      };
+    }
   }
 
   if (ctx.ledger.openPositions().length >= MAX_OPEN_POSITIONS) {

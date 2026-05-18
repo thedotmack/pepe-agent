@@ -86,8 +86,21 @@ export interface StateStore {
    * resolves (ok / failed_onchain / not_landed / landed_after_timeout /
    * no_token_account). Clears the TRADING phase. Without this the state
    * machine would otherwise stay TRADING until the 90s safety timeout fires.
+   *
+   * Phase 5: accepts an optional structured meta payload so call-sites can
+   * communicate side / txid / outcome to whatever downstream decision-log
+   * persistence we wire up later (Phase 7+). The implementation currently
+   * only uses `reason` for phase transitions, but accepting the shape now
+   * means we don't have to chase 13 call-sites again when we wire it.
    */
-  recordTradeResult(reason: string): void;
+  recordTradeResult(
+    reason: string,
+    meta?: {
+      side?: "BUY" | "SELL";
+      txid?: string;
+      outcome?: string;
+    },
+  ): void;
   /** Auto-transition WATCHING/TRADING/CALLING → IDLE based on idle/grace timers. */
   tick(now: number): void;
 }
@@ -181,9 +194,13 @@ export function createStateStore(args: CreateStateStoreArgs): StateStore {
     lastTransitionMs = Date.now();
   }
 
-  function recordTradeResult(_reason: string): void {
+  function recordTradeResult(
+    _reason: string,
+    _meta?: { side?: "BUY" | "SELL"; txid?: string; outcome?: string },
+  ): void {
     // Phase 4: trade handler reports completion (any variant). Only clear
     // TRADING — never reach in from outside if we were never in TRADING.
+    // Phase 5: meta is accepted but not yet persisted — see interface JSDoc.
     if (phase === "TRADING") {
       phase = "WATCHING";
       tradingSinceMs = null;

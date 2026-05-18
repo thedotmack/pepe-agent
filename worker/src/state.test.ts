@@ -34,6 +34,7 @@ function fakeLedger(): TradeLedger {
     hasTradeTxid: () => false,
     lastTradeMs: () => null,
     totalSolToday: () => 0,
+    dailyBuySolToday: () => 0,
     openPositions: () => [],
     openPosition: () => {},
     setPositionDecimals: () => {},
