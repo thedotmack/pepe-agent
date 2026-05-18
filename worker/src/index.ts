@@ -7,7 +7,7 @@ import { createClaudeMemClient } from "./memory/claude-mem-client.ts";
 import { mintContentSessionId } from "./memory/session.ts";
 import { startMemoryTick } from "./memory/tick.ts";
 import { createAgentLoop } from "./agent/loop.ts";
-import { startAutoTick } from "./agent/auto-tick.ts";
+import { startAutoTick, createTurnIdleRef } from "./agent/auto-tick.ts";
 import { startPositionMonitor } from "./agent/position-monitor.ts";
 import { openLedger } from "./trade/ledger.ts";
 import { tryGetPublicKey } from "./trade/wallet.ts";
@@ -220,6 +220,14 @@ async function main() {
 
   // Agent loop (Phase 3). Boots only if ANTHROPIC_API_KEY is set; otherwise
   // the worker still serves subscribers + memory tick.
+  //
+  // Phase 11 (codex Phase 10 re-audit H2): turnIdleRef is shared between
+  // auto-tick and /chat-stream. Both inject into the same agent emitter;
+  // each must flip this off BEFORE injecting so the other doesn't stack
+  // work on top of an in-flight turn. Created once here and passed to
+  // BOTH auto-tick and worker-server. Created up front (even when agent
+  // is null) so worker-server doesn't have to deal with optional plumbing.
+  const turnIdleRef = createTurnIdleRef();
   let agent: ReturnType<typeof createAgentLoop> | null = null;
   let autoTick: ReturnType<typeof startAutoTick> | null = null;
   let positionMonitor: ReturnType<typeof startPositionMonitor> | null = null;
@@ -249,7 +257,7 @@ async function main() {
       // Phase 2 + Phase 3: autonomous entry + exit signallers. Must start
       // AFTER agent.start() so emitter listeners are wired before the first
       // tick fires.
-      autoTick = startAutoTick({ subscriber, agent, stateStore });
+      autoTick = startAutoTick({ subscriber, agent, stateStore, turnIdleRef });
       log.info("auto-tick started");
       positionMonitor = startPositionMonitor({ ledger, agent, stateStore });
       log.info("position-monitor started");
@@ -266,7 +274,7 @@ async function main() {
   // Worker HTTP server (must be started AFTER the agent loop is created so
   // POST /chat can inject into the live query session). When agent is null
   // the server still serves /state, /healthz, /kill — /chat returns 503.
-  const server = startWorkerServer({ stateStore, killSwitchRef, agent, ledger });
+  const server = startWorkerServer({ stateStore, killSwitchRef, agent, ledger, turnIdleRef });
 
   const shutdown = async (signal: string) => {
     log.warn(`received ${signal}, shutting down`);

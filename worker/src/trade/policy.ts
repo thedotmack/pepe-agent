@@ -185,12 +185,95 @@ export function checkTradePolicy(
     }
   }
 
-  if (ctx.ledger.openPositions().length >= MAX_OPEN_POSITIONS) {
+  // Max open positions gates BUYs only — SELLs are emergency exits and must
+  // always be allowed when the trade is structurally valid. Throttling a
+  // SELL because we're at the position cap would mean we can never exit
+  // *because* we have positions to exit, which inverts the gate's intent.
+  // Mirrors the TANK_EMPTY / cooldown / per-trade / daily-cap pattern: BUYs
+  // are capital-deployment events that benefit from rate-limiting; SELLs are
+  // risk-management events that must always be able to fire. Phase 11
+  // (codex Phase 10 re-audit #1).
+  if (
+    intent.side === "BUY" &&
+    ctx.ledger.openPositions().length >= MAX_OPEN_POSITIONS
+  ) {
     return {
       allow: false,
       reason: `max open positions (${MAX_OPEN_POSITIONS}) reached`,
     };
   }
 
+  return { allow: true };
+}
+
+/**
+ * Phase 11 (codex Phase 10 re-audit #3): minimal shape needed from a Jupiter
+ * QuoteResponse to gate route-liquidity. Kept local so callers can pass any
+ * object with these fields — production callers pass a real `QuoteResponse`
+ * from jupiter.ts, tests pass plain literals.
+ *
+ * - `routePlan` empty (length === 0) means Jupiter found NO route. Submitting
+ *   the trade would either revert on-chain or burn lamports for nothing.
+ * - `priceImpactPct` is a string-decimal ("0.123" == 12.3%). Above the hard
+ *   ceiling we treat the pool as illiquid — accepting the trade would mean
+ *   eating >50% slippage, which is never a desirable BUY/SELL outcome
+ *   regardless of the policy's per-trade caps.
+ */
+export interface RouteLiquidityQuote {
+  routePlan: unknown[];
+  priceImpactPct: string;
+}
+
+/**
+ * Hard ceiling for priceImpactPct (50%). Above this the pool is illiquid
+ * enough that the executed price drifts wildly from the quoted price and
+ * the trade isn't worth attempting. The position-monitor's softer 10%
+ * ILLIQUID_PRICE_IMPACT threshold is informational; this 50% ceiling is a
+ * hard deny — matches the auto-tick's liquidity prefilter so /chat-driven
+ * trades can't bypass it. Codex re-audit #3.
+ */
+export const ROUTE_LIQUIDITY_MAX_PRICE_IMPACT = 0.5;
+
+/**
+ * Route-liquidity gate. Separate from checkTradePolicy because the policy
+ * runs at PreToolUse / canUseTool / handler-entry — all of which fire BEFORE
+ * we have a quote. The handler fetches the quote and calls this immediately
+ * after, before signing. Three sites — PreToolUse hook, canUseTool, handler
+ * — won't all have a quote, so this lives outside checkTradePolicy.
+ *
+ * Codex finding #3: the auto-tick prefilters tokens by liquidity / buy-
+ * pressure / 5m gain before suggesting them to the agent. A /chat-driven
+ * trade attempt skips that prefilter entirely — the agent can steer toward
+ * any mint at all. This gate puts the floor back: a quote with no route or
+ * a >50% priceImpactPct is denied at the trade boundary, regardless of how
+ * the agent picked the mint.
+ *
+ * Returns the same PolicyResult shape as checkTradePolicy so the handler
+ * can treat both checks identically (deny → record + return).
+ */
+export function checkRouteLiquidity(quote: RouteLiquidityQuote): PolicyResult {
+  if (!Array.isArray(quote.routePlan) || quote.routePlan.length === 0) {
+    return {
+      allow: false,
+      reason: "no Jupiter route found (routePlan empty)",
+    };
+  }
+  // Jupiter returns priceImpactPct as a string-decimal. parseFloat handles
+  // both "0.123" and the rare "0" / undefined cases. Anything non-numeric
+  // (NaN) is denied — better to refuse a trade we can't interpret than to
+  // accept an unknown.
+  const impact = parseFloat(quote.priceImpactPct ?? "");
+  if (!Number.isFinite(impact)) {
+    return {
+      allow: false,
+      reason: `priceImpactPct not parseable: ${JSON.stringify(quote.priceImpactPct)}`,
+    };
+  }
+  if (impact > ROUTE_LIQUIDITY_MAX_PRICE_IMPACT) {
+    return {
+      allow: false,
+      reason: `priceImpactPct ${(impact * 100).toFixed(1)}% over hard ceiling ${(ROUTE_LIQUIDITY_MAX_PRICE_IMPACT * 100).toFixed(0)}%`,
+    };
+  }
   return { allow: true };
 }

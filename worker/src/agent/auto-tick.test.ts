@@ -217,3 +217,101 @@ describe("auto-tick turnIdle race (Phase 4)", () => {
     expect(agent.injects.length).toBe(0);
   });
 });
+
+// ─── Phase 11 (codex Phase 10 re-audit H2): shared turnIdle plumbing ────
+// Pre-Phase-11 the turnIdle flag lived inside startAutoTick's closure.
+// A /chat injection would invoke agent.injectUserMessage directly, never
+// flipping that flag — so auto-tick's 15s push could stack a snapshot
+// injection on top of the in-flight chat turn. Phase 11 introduces a
+// shared TurnIdleRef passed to BOTH sites.
+
+describe("auto-tick + chat-stream shared turnIdleRef (Phase 11 H2)", () => {
+  it("auto-tick respects a turnIdleRef flipped false externally (simulating /chat)", async () => {
+    const { createTurnIdleRef } = await import("./auto-tick.ts");
+    const agent = fakeAgent();
+    const subscriber = fakeSubscriber([passingToken("EEE")]);
+    const stateStore = fakeStateStore("WATCHING");
+
+    // External code (e.g. chat-stream.ts) flips this BEFORE auto-tick's
+    // first interval fires. auto-tick should see false and skip.
+    const turnIdleRef = createTurnIdleRef();
+    turnIdleRef.current = false;
+
+    const handle = startAutoTick({
+      subscriber,
+      agent,
+      stateStore,
+      turnIdleRef,
+      pushIntervalMs: 50,
+      decisionIntervalMs: 60_000,
+    });
+    await sleep(200);
+    handle.stop();
+
+    // Pre-fix: auto-tick's private turnIdle would still be true, and it
+    // would have pushed a snapshot even though /chat marked turn busy.
+    // Post-fix: shared ref means auto-tick sees the false flip and skips.
+    expect(agent.injects.length).toBe(0);
+  });
+
+  it("auto-tick resumes pushing after a `result` event resets the shared ref", async () => {
+    const { createTurnIdleRef } = await import("./auto-tick.ts");
+    const agent = fakeAgent();
+    const subscriber = fakeSubscriber([passingToken("FFF")]);
+    const stateStore = fakeStateStore("WATCHING");
+
+    const turnIdleRef = createTurnIdleRef();
+    turnIdleRef.current = false;
+
+    const handle = startAutoTick({
+      subscriber,
+      agent,
+      stateStore,
+      turnIdleRef,
+      pushIntervalMs: 50,
+      decisionIntervalMs: 60_000,
+    });
+    // First few intervals must skip (turnIdleRef.current=false).
+    await sleep(150);
+    expect(agent.injects.length).toBe(0);
+
+    // Simulate the chat turn ending — agent emits `result`. auto-tick's
+    // listener should flip the SHARED ref back to true.
+    agent.emitter.emit("result", { type: "result" });
+    // The shared ref must now reflect that — direct check.
+    expect(turnIdleRef.current).toBe(true);
+
+    // Now the next interval should inject.
+    await sleep(120);
+    handle.stop();
+    expect(agent.injects.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("auto-tick flips the shared ref false on its own inject (so chat-stream / external code can read it)", async () => {
+    const { createTurnIdleRef } = await import("./auto-tick.ts");
+    const agent = fakeAgent();
+    const subscriber = fakeSubscriber([passingToken("GGG")]);
+    const stateStore = fakeStateStore("WATCHING");
+
+    // Start with ref idle=true so the first tick injects.
+    const turnIdleRef = createTurnIdleRef();
+    expect(turnIdleRef.current).toBe(true);
+
+    const handle = startAutoTick({
+      subscriber,
+      agent,
+      stateStore,
+      turnIdleRef,
+      pushIntervalMs: 50,
+      decisionIntervalMs: 60_000,
+    });
+    await sleep(120);
+    handle.stop();
+
+    // After auto-tick injected, the shared ref must be false — proving
+    // auto-tick's inject side updates the same object the /chat side
+    // observes. (If auto-tick wrote to a private flag this would be true.)
+    expect(agent.injects.length).toBeGreaterThanOrEqual(1);
+    expect(turnIdleRef.current).toBe(false);
+  });
+});

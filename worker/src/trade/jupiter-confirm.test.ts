@@ -274,6 +274,45 @@ describe("signAndSend confirmation paths (Phase 2)", () => {
     }
   });
 
+  it("Phase 11 P11-L1.C3: pre-send aborted externalSignal returns not_landed with no broadcast", async () => {
+    // Phase 10 (codex re-audit #5) added a pre-send guard that short-circuits
+    // signAndSend if externalSignal aborted BEFORE the initial
+    // sendRawTransaction. Without this guard, a /kill that tripped between
+    // policy approval and signAndSend entry would still leak one final tx
+    // onto the network. Pre-send abort returns txid=null with reason set.
+    //
+    // This test pins that behavior: pass an already-aborted AbortSignal as
+    // externalSignal to executeTrade. Expect:
+    //   - result.status === "not_landed"
+    //   - result.txid === null (never broadcast)
+    //   - sendRawTransactionCalls === 0 (the FakeConnection counter never
+    //     incremented — proves we didn't even reach the send path)
+    resetRpc();
+    const controller = new AbortController();
+    controller.abort(); // pre-abort before executeTrade fires
+
+    const result = await executeTrade({
+      inputMint: SOL_MINT,
+      outputMint: TOKEN_MINT,
+      amountSol: 0.1,
+      slippageBps: 100,
+      decimals: 6,
+      externalSignal: controller.signal,
+    });
+
+    expect(result.status).toBe("not_landed");
+    if (result.status === "not_landed") {
+      // The CRITICAL assertion: txid must be null on the pre-send abort
+      // path. A real txid here would mean we broadcast even though /kill
+      // had tripped — the exact scenario the Phase 10 guard prevents.
+      expect(result.txid).toBeNull();
+      // Reason is "aborted before send" per Phase 10 design.
+      expect(result.reason).toMatch(/aborted before send/i);
+    }
+    // No tx ever broadcast — the counter is the load-bearing assertion.
+    expect(rpc.sendRawTransactionCalls).toBe(0);
+  });
+
   it("fires the rebroadcast loop at least once while confirmation is slow", async () => {
     resetRpc();
     // Phase 7 H2: hold confirmation just past one rebroadcast interval (so

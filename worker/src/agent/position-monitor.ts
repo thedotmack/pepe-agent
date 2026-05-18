@@ -46,6 +46,44 @@ const TP_GAIN = 0.30;
 const SL_LOSS = -0.15;
 const RUG_TICK = -0.50;
 /**
+ * Phase 11 (codex Phase 10 re-audit #2): hard ceiling around the spl-token
+ * RPC calls (getMint, getAccount). Neither has an overall-await timeout —
+ * a flaky validator or DNS stall would otherwise wedge the entire
+ * setInterval body forever, blocking every other position's tick AND
+ * pinning `running = true` so subsequent intervals do nothing. 10s is
+ * generous enough for mainnet on a bad day and tight enough that one
+ * stalled mint doesn't cost a TP/SL signal across all the others.
+ *
+ * Same constant as Phase 10's BALANCE_RPC_TIMEOUT_MS in index.ts so an
+ * operator only learns one number. On timeout we log + continue to the
+ * next position rather than crash the monitor.
+ */
+const MONITOR_RPC_TIMEOUT_MS = 10_000;
+
+/**
+ * Race a promise against a timeout. Mirrors the AbortSignal.timeout pattern
+ * in index.ts's BALANCE_RPC_TIMEOUT_MS plumbing — uses the same primitive so
+ * the two timeout sites read identically. On timeout: rejects with a
+ * descriptive Error so the caller's catch sees a real error message instead
+ * of a silent AbortError. Callers log + skip, never crash.
+ */
+function withRpcTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+  return Promise.race([
+    operation,
+    new Promise<T>((_, reject) => {
+      const signal = AbortSignal.timeout(MONITOR_RPC_TIMEOUT_MS);
+      signal.addEventListener(
+        "abort",
+        () =>
+          reject(
+            new Error(`${label} timeout after ${MONITOR_RPC_TIMEOUT_MS}ms`),
+          ),
+        { once: true },
+      );
+    }),
+  ]);
+}
+/**
  * Sanity bounds for current/entry price ratio. If the ratio falls outside
  * [1e-4, 1e4] on a tick we treat it as a decimals-misconfig safety net and
  * skip the tick — better to delay an exit by 10s than to emit a fake RUG.
@@ -105,7 +143,14 @@ export function startPositionMonitor(
           if (!Number.isFinite(decimals) || decimals <= 0) {
             try {
               const rpc = new Connection(defaultRpcUrl(), "confirmed");
-              const mintInfo = await getMint(rpc, new PublicKey(pos.tokenId));
+              // Phase 11 (#2): wrap getMint in MONITOR_RPC_TIMEOUT_MS race.
+              // spl-token has no overall-await timeout; a hung RPC would
+              // wedge the whole monitor tick. On timeout: log + continue
+              // to the next position (don't crash the monitor).
+              const mintInfo = await withRpcTimeout(
+                getMint(rpc, new PublicKey(pos.tokenId)),
+                `getMint(${pos.tokenId})`,
+              );
               decimals = mintInfo.decimals;
               args.ledger.setPositionDecimals(pos.tokenId, decimals);
               log.info(`backfilled decimals=${decimals} for ${pos.tokenId}`);
@@ -129,7 +174,14 @@ export function startPositionMonitor(
                 new PublicKey(pos.tokenId),
                 ownerPk,
               );
-              const acct = await getAccount(rpc, ata);
+              // Phase 11 (#2): wrap getAccount in MONITOR_RPC_TIMEOUT_MS
+              // race. Same rationale as getMint above. Failure here is
+              // best-effort backfill — we just leave the row at "0" and
+              // try again next tick.
+              const acct = await withRpcTimeout(
+                getAccount(rpc, ata),
+                `getAccount(${pos.tokenId})`,
+              );
               args.ledger.setPositionTokensReceived(pos.tokenId, acct.amount);
               log.info(
                 `backfilled tokensReceivedAtomic=${acct.amount.toString()} for ${pos.tokenId}`,
@@ -205,10 +257,50 @@ export function startPositionMonitor(
 
           if (reason) {
             log.info(`exit signal for ${sym} (${pos.tokenId}): ${reason}`);
+            // Phase 11 (codex Phase 10 re-audit H1): give the agent the
+            // exact sellAmountTokens (UI units) to plug into submit_trade.
+            // Pre-Phase-11: prompt referenced sizeSol but not the UI tokens
+            // — the agent had to derive them from get_open_positions, and
+            // any mismatch with the stored tokensReceivedAtomic produced an
+            // insufficient_token_balance or partial-exit bug.
+            //
+            // We compute UI = atomic / 10^decimals via BigInt math (safe for
+            // u64) then format as a decimal string. The agent passes the UI
+            // value verbatim into submit_trade; the handler floors back to
+            // atomic before sending to Jupiter, so this is exact.
+            //
+            // Legacy rows with tokensReceivedAtomic="0" (Phase 10 backfill
+            // pending) fall back to "<pending-backfill>" so the agent narrates
+            // the exit reason but waits for the next monitor tick to provide
+            // a real number rather than guessing.
+            let sellAmountTokensLabel = "<pending-backfill>";
+            try {
+              const atomic = BigInt(pos.tokensReceivedAtomic);
+              if (atomic > 0n) {
+                const denom = 10n ** BigInt(decimals);
+                const whole = atomic / denom;
+                const frac = atomic % denom;
+                if (frac === 0n) {
+                  sellAmountTokensLabel = whole.toString();
+                } else {
+                  // Pad the fractional part to `decimals` digits, then trim
+                  // trailing zeros for readability. e.g. 1_999_999_999n with
+                  // decimals=9 → "1.999999999"; trailing zeros become "1.5".
+                  const fracStr = frac.toString().padStart(decimals, "0");
+                  const fracTrimmed = fracStr.replace(/0+$/, "");
+                  sellAmountTokensLabel = fracTrimmed.length > 0
+                    ? `${whole.toString()}.${fracTrimmed}`
+                    : whole.toString();
+                }
+              }
+            } catch {
+              // Unparseable tokensReceivedAtomic (shouldn't happen — schema
+              // stores stringified bigint). Leave label as pending-backfill.
+            }
             args.agent.injectUserMessage(
-              `Exit signal: ${reason}\n` +
-                `Position: tokenId=${pos.tokenId}, sizeSol=${pos.sizeSol}.\n` +
-                `Submit a sell now — use submit_trade with tokenIn=${pos.tokenId}, tokenOut=SOL.\n` +
+              `Exit signal for $${sym}: ${reason}\n` +
+                `Position: tokenId=${pos.tokenId}, sizeSol=${pos.sizeSol}, decimals=${decimals}, tokensReceivedAtomic=${pos.tokensReceivedAtomic}.\n` +
+                `Submit a sell now — use submit_trade with side="SELL", tokenIn=${pos.tokenId}, tokenOut=SOL, sellAmountTokens=${sellAmountTokensLabel}.\n` +
                 `Narrate the exit in one sentence.`,
             );
             // One exit at a time — let the turn resolve before re-evaluating.

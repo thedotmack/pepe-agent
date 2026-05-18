@@ -16,12 +16,28 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { ActivitySubscriber, ActivityToken } from "../../activity/subscriber.ts";
 import type { TradeIntent, PolicyResult } from "../../trade/policy.ts";
-import { DEFAULT_SLIPPAGE_BPS, SLIPPAGE_HARD_CAP_BPS, PER_TRADE_MAX_SOL } from "../../trade/policy.ts";
+import {
+  DEFAULT_SLIPPAGE_BPS,
+  SLIPPAGE_HARD_CAP_BPS,
+  PER_TRADE_MAX_SOL,
+  checkRouteLiquidity,
+} from "../../trade/policy.ts";
 import type { TradeLedger } from "../../trade/ledger.ts";
 import { executeTrade, getQuote as jupGetQuote, defaultRpcUrl } from "../../trade/jupiter.ts";
 // spl-token getMint signature: getMint(connection, mintPubkey) → { decimals, ... }.
-import { getMint } from "@solana/spl-token";
+// Phase 11 (codex Phase 10 re-audit #4): also need getAccount +
+// getAssociatedTokenAddressSync + TokenAccountNotFoundError so the BUY flow
+// can read the actual on-chain ATA balance post-confirm instead of trusting
+// the quote.outAmount promise (which is the QUOTED output, not the
+// slippage-adjusted reality).
+import {
+  getMint,
+  getAccount,
+  getAssociatedTokenAddressSync,
+  TokenAccountNotFoundError,
+} from "@solana/spl-token";
 import { Connection, PublicKey } from "@solana/web3.js";
+import { getPublicKey } from "../../trade/wallet.ts";
 import type { ClaudeMemClient } from "../../memory/claude-mem-client.ts";
 import type { StateStore, KillSwitchRef as StateKillSwitchRef } from "../../state.ts";
 import { createLogger } from "../../logger.ts";
@@ -51,6 +67,63 @@ function rankToken(t: ActivityToken): number {
   const gain = t.fiveMinGain ?? t.threeMinGain ?? t.oneMinGain ?? 0;
   const vol = t.volume24h ?? 0;
   return gain * 1000 + vol / 1_000_000;
+}
+
+/**
+ * Phase 11 (codex Phase 10 re-audit #4): read the post-BUY ATA balance and
+ * return the delta over the pre-BUY balance. This is the EXACT on-chain
+ * quantity that landed, after slippage. Falls back to BigInt(quoteOutAmount)
+ * if either the post-balance read fails OR the delta is non-positive
+ * (defensive — shouldn't happen on an "ok" / "landed_after_timeout" result).
+ *
+ * Why post-confirm-balance over quote.outAmount:
+ *   - quote.outAmount is the QUOTED output (best-case fill).
+ *   - actual on-chain fill is up to slippageBps below quoted (default 100bps
+ *     ⇒ up to 1% less).
+ *   - storing the quote value overstates the position size, causing later
+ *     SELL paths to over-request and hit insufficient_token_balance on exit.
+ *
+ * If even the fallback BigInt parse fails (malformed quote), return 0n so
+ * the row stores "0" and position-monitor's lazy backfill recovers from the
+ * ATA on the next tick.
+ */
+async function readPostBuyDelta(
+  outputMint: string,
+  preBuyBalance: bigint,
+  quoteOutAmount: string,
+): Promise<bigint> {
+  try {
+    const rpc = new Connection(defaultRpcUrl(), "confirmed");
+    const ownerPk = new PublicKey(getPublicKey());
+    const ata = getAssociatedTokenAddressSync(new PublicKey(outputMint), ownerPk);
+    const acct = await getAccount(rpc, ata);
+    const delta = acct.amount - preBuyBalance;
+    if (delta > 0n) return delta;
+    // Defensive: a non-positive delta on a confirmed BUY means either
+    // (a) we misread the pre-balance (race with another process touching
+    // the same ATA — shouldn't happen but isn't impossible), or
+    // (b) the tx landed but the swap somehow netted to 0 tokens — also
+    // shouldn't happen for an "ok" status. Fall back to the quote so the
+    // position row stores a plausible value; backfill from ATA fixes it
+    // next monitor tick if reality diverges further.
+    log.warn(
+      `post-BUY delta non-positive (${delta.toString()}) for ${outputMint}; falling back to quote.outAmount`,
+    );
+  } catch (err) {
+    log.warn(
+      `post-BUY balance read failed for ${outputMint} (will fall back to quote.outAmount): ${String(err)}`,
+    );
+  }
+  // Fallback: parse the quote's outAmount. If THAT also fails, return 0n —
+  // position-monitor's lazy backfill recovers the real value from the ATA.
+  try {
+    return BigInt(quoteOutAmount);
+  } catch {
+    log.warn(
+      `quote.outAmount not bigint-parseable: ${String(quoteOutAmount)}; deferring to ATA backfill`,
+    );
+    return 0n;
+  }
 }
 
 /**
@@ -277,6 +350,69 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
         }
       }
 
+      // Phase 11 (codex Phase 10 re-audit #3): route-liquidity gate.
+      // Auto-tick prefilters candidates by liquidity / buy-pressure / 5m gain
+      // before suggesting them to the agent, but a /chat-driven trade attempt
+      // skips that prefilter entirely — the agent can steer toward any mint.
+      // This gate puts the floor back: a preview quote with no route OR a
+      // priceImpactPct over the 50% hard ceiling is denied here, regardless
+      // of how the agent picked the mint. Denial happens BEFORE we sign and
+      // broadcast, so it costs only the Jupiter /quote roundtrip.
+      //
+      // The trade goes through with a fresh quote inside executeTrade — by
+      // the time we get to network the route may differ slightly, but the
+      // structural check (route exists + impact bounded) is the same. Race
+      // window is small (<100ms typical), and the gate is sufficient to
+      // match auto-tick's prefilter intent at the trade boundary.
+      try {
+        // Mirror executeTrade's amountAtomic computation so the preview quote
+        // matches what executeTrade will fetch:
+        //   BUY  → SOL atomic units (lamports = round(amountSol * 1e9))
+        //   SELL → input-token atomic uint64 (computed above)
+        const previewAmount =
+          side === "BUY"
+            ? BigInt(Math.round((input.amountSol as number) * 1e9)).toString()
+            : (sellAmountAtomic as bigint).toString();
+        const previewQuote = await jupGetQuote({
+          inputMint: input.tokenIn,
+          outputMint: input.tokenOut,
+          amount: previewAmount,
+          slippageBps: input.slippageBps,
+        });
+        const liquidity = checkRouteLiquidity(previewQuote);
+        if (!liquidity.allow) {
+          log.warn(
+            `submit_trade route-liquidity denied: ${liquidity.reason} for ${input.tokenIn}→${input.tokenOut}`,
+          );
+          stateStore.recordDecision({
+            ts: Date.now(),
+            symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+            action: "PASS",
+            reason: `route-liquidity: ${liquidity.reason}`,
+          });
+          stateStore.recordTradeResult(`route-liquidity: ${liquidity.reason}`, {
+            side,
+            outcome: "denied_route_liquidity",
+          });
+          return {
+            content: [
+              { type: "text", text: `denied: ${liquidity.reason}` },
+            ],
+            isError: true,
+          };
+        }
+      } catch (err) {
+        // Preview quote failed — log warn but proceed. executeTrade's own
+        // quote fetch will retry and surface a structured error path
+        // (no_token_account, insufficient_token_balance, or thrown). Failing
+        // closed here would create a false-positive deny when Jupiter is
+        // flaky; failing open here means a momentary Jupiter blip doesn't
+        // mask a legitimate trade attempt. Trade-off documented for codex.
+        log.warn(
+          `submit_trade route-liquidity preview quote failed (continuing to executeTrade): ${String(err)}`,
+        );
+      }
+
       // Phase 4: tight kill switch check just before send. The PreToolUse
       // hook + canUseTool both check kill switch state at decision time, but
       // a /kill that races between those gates and this line would otherwise
@@ -301,11 +437,48 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
 
       let txid: string;
       let executedPriceSolPerToken: number | null;
-      // Phase 10 (#1): track the exact uint64 of non-SOL tokens received on a
-      // BUY so the position row stores the real on-chain quantity instead of
-      // an approximation. Read from quote.outAmount on the "ok" /
-      // "landed_after_timeout" branches; ignored on SELL.
+      // Phase 11 (codex Phase 10 re-audit #4): track the exact uint64 of
+      // non-SOL tokens received on a BUY by reading the on-chain ATA balance
+      // delta around the trade, NOT by trusting quote.outAmount.
+      // quote.outAmount is the QUOTED output Jupiter promised, which differs
+      // from the slippage-adjusted real value that landed on-chain (especially
+      // with the 100bps default slippage tolerance — actual fill can be
+      // anywhere up to 1% below quoted). Storing the quote value would
+      // overstate the position size and cause SELL paths to over-request,
+      // hitting insufficient_token_balance on exit.
+      //
+      // Pre-BUY ATA balance is captured here (may be 0n if the ATA doesn't
+      // exist yet — common for a fresh mint, Jupiter creates it during the
+      // swap with wrapAndUnwrapSol). Post-BUY balance is read after
+      // executeTrade returns "ok" / "landed_after_timeout". Delta is what
+      // landed on-chain. SELL path is unaffected — its tokensReceivedAtomic
+      // was set at the prior BUY.
       let tokensReceivedAtomic: bigint = 0n;
+      let preBuyBalance: bigint = 0n;
+      if (side === "BUY") {
+        try {
+          const rpc = new Connection(defaultRpcUrl(), "confirmed");
+          const ownerPk = new PublicKey(getPublicKey());
+          const ata = getAssociatedTokenAddressSync(
+            new PublicKey(input.tokenOut),
+            ownerPk,
+          );
+          const acct = await getAccount(rpc, ata);
+          preBuyBalance = acct.amount;
+        } catch (err) {
+          // Most common case: ATA doesn't exist yet (Jupiter will create it
+          // during the swap). TokenAccountNotFoundError ⇒ pre-balance is 0n,
+          // which is the correct value. Other errors get logged but don't
+          // abort the trade — we'll fall back to BigInt(quote.outAmount) for
+          // tokensReceivedAtomic in the post-branch if post-balance read also
+          // fails.
+          if (!(err instanceof TokenAccountNotFoundError)) {
+            log.warn(
+              `pre-BUY balance read failed for ${input.tokenOut} (will fall back to quote.outAmount on success): ${String(err)}`,
+            );
+          }
+        }
+      }
       // landedLate is true only on the "landed_after_timeout" path — caller
       // records the trade and closes the position (it did land) but notes
       // the late-landing in the reason for downstream reconciliation.
@@ -337,20 +510,18 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
           case "ok":
             txid = result.txid;
             executedPriceSolPerToken = result.executedPriceSolPerToken;
-            // Phase 10 (#1): quote.outAmount on a BUY is the exact uint64 of
-            // non-SOL tokens received. Parse via BigInt (string-safe; never
-            // through Number which would round at 2^53). Set only on BUY —
-            // SELL's outAmount is lamports, not the token we're holding.
+            // Phase 11 (codex Phase 10 re-audit #4): read post-confirm ATA
+            // balance for the actual delta, NOT quote.outAmount (the quote's
+            // PROMISED output, which differs from the slippage-adjusted real
+            // fill). Fall back to quote.outAmount only if the ATA read fails
+            // — better an approximate value than 0n, and position-monitor's
+            // lazy backfill will correct it next tick. SELL path unaffected.
             if (side === "BUY") {
-              try {
-                tokensReceivedAtomic = BigInt(result.quote.outAmount);
-              } catch {
-                // Malformed quote field — leave as 0n so the row stores '0'
-                // and position-monitor's lazy backfill recovers from ATA.
-                log.warn(
-                  `submit_trade quote.outAmount not bigint-parseable: ${String(result.quote.outAmount)}; deferring to ATA backfill`,
-                );
-              }
+              tokensReceivedAtomic = await readPostBuyDelta(
+                input.tokenOut,
+                preBuyBalance,
+                result.quote.outAmount,
+              );
             }
             break;
           case "landed_after_timeout":
@@ -362,17 +533,16 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
             );
             txid = result.txid;
             executedPriceSolPerToken = result.executedPriceSolPerToken;
-            // Phase 10 (#1): same as "ok" — the tx did land, so the quote's
-            // outAmount is what we received. Reconcile-flagged in the trade
-            // reason but the on-chain effect is real.
+            // Phase 11 (#4): same as "ok" — the tx did land, so reading the
+            // post-confirm ATA delta gives the real on-chain quantity. The
+            // tx landed late but the chain effect is real, so the balance
+            // read is valid.
             if (side === "BUY") {
-              try {
-                tokensReceivedAtomic = BigInt(result.quote.outAmount);
-              } catch {
-                log.warn(
-                  `submit_trade quote.outAmount not bigint-parseable (late): ${String(result.quote.outAmount)}; deferring to ATA backfill`,
-                );
-              }
+              tokensReceivedAtomic = await readPostBuyDelta(
+                input.tokenOut,
+                preBuyBalance,
+                result.quote.outAmount,
+              );
             }
             landedLate = true;
             break;

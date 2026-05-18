@@ -30,10 +30,43 @@ import { createLogger } from "../logger.ts";
 
 const log = createLogger("agent.auto-tick");
 
+/**
+ * Phase 11 (codex Phase 10 re-audit H2): shared turnIdle flag.
+ *
+ * /chat-stream injections and auto-tick injections both have to know when
+ * the agent is mid-turn so neither pushes a new injection on top of an
+ * in-flight one. Pre-Phase-11 auto-tick had a local `turnIdle` boolean
+ * that only it touched, and /chat's `injectUserMessage` call didn't flip
+ * it — so auto-tick's 15s push could fire ON TOP of a /chat turn that the
+ * agent was still processing, stacking work.
+ *
+ * The shared ref is a tiny mutable wrapper: { current: boolean }. Both
+ * call sites (auto-tick's pushInterval body + chat-stream's inject) read
+ * and write `ref.current`. The agent's `result` event is the only event
+ * that flips it back to `true`. Use createTurnIdleRef() to construct one;
+ * wire to both sites in boot (index.ts).
+ */
+export interface TurnIdleRef {
+  current: boolean;
+}
+
+export function createTurnIdleRef(): TurnIdleRef {
+  return { current: true };
+}
+
 export interface CreateAutoTickArgs {
   subscriber: ActivitySubscriber;
   agent: AgentLoopHandle;
   stateStore: StateStore;
+  /**
+   * Phase 11 (H2): shared turn-idle flag. Both auto-tick and /chat-stream
+   * inject into the same agent emitter; if /chat's injection doesn't flip
+   * this off, the next auto-tick push fires on top of an in-flight chat
+   * turn. Defaults to a fresh ref if omitted so existing tests keep
+   * working unchanged; production boot creates ONE ref and passes the
+   * same instance to auto-tick AND chat-stream.
+   */
+  turnIdleRef?: TurnIdleRef;
   /** Default 15_000ms — market push cadence. */
   pushIntervalMs?: number;
   /** Default 45_000ms — decision-prompt cadence (when phase==WATCHING/IDLE). */
@@ -51,15 +84,19 @@ export function startAutoTick(args: CreateAutoTickArgs): AutoTickHandle {
   const decisionMs = args.decisionIntervalMs ?? 45_000;
   const topN = args.topN ?? 5;
 
-  // Phase 4: turnIdle is now flipped to `false` AT INJECTION TIME so we
-  // never push a second context/decision turn while the previous injection
-  // is still being processed by the SDK. assistantText is an unreliable
-  // trigger because the agent may go through tool calls before emitting
-  // text — between inject and first token, the 15s push could fire again.
-  // Set false on inject; set true only on `result` (turn fully ended).
-  let turnIdle = true;
+  // Phase 4: turnIdle is flipped to `false` AT INJECTION TIME so we never
+  // push a second context/decision turn while the previous injection is
+  // still being processed by the SDK. assistantText is an unreliable trigger
+  // because the agent may go through tool calls before emitting text —
+  // between inject and first token, the 15s push could fire again.
+  //
+  // Phase 11 (H2): the flag is now SHARED with /chat-stream via TurnIdleRef
+  // so a chat injection flips it false and auto-tick respects that. Default
+  // to a fresh ref if no shared one was passed so existing tests behave
+  // unchanged (each test still gets its own auto-tick-private idle flag).
+  const turnIdleRef = args.turnIdleRef ?? createTurnIdleRef();
   args.agent.emitter.on("result", () => {
-    turnIdle = true;
+    turnIdleRef.current = true;
   });
 
   let lastDecisionAt = 0;
@@ -85,7 +122,10 @@ export function startAutoTick(args: CreateAutoTickArgs): AutoTickHandle {
     const phase = args.stateStore.snapshot().phase;
     // Never inject context mid-turn — race city. Anti-pattern guard from plan.
     if (phase === "TRADING" || phase === "CALLING") return;
-    if (!turnIdle) return;
+    // Phase 11 (H2): shared turn-idle ref. Reads as `current`. A /chat
+    // injection from chat-stream.ts will have set this false; we must NOT
+    // push a snapshot on top of an in-flight chat turn.
+    if (!turnIdleRef.current) return;
 
     const snap = args.subscriber.getSnapshot();
     if (snap.length === 0) return;
@@ -111,11 +151,13 @@ export function startAutoTick(args: CreateAutoTickArgs): AutoTickHandle {
       })),
     });
 
-    // Phase 4: flip turnIdle=false BEFORE the inject lands. The SDK may
-    // take several seconds to start emitting tokens; in the meantime the
-    // next pushInterval tick must NOT inject again. `result` (turn fully
-    // ended) is the only event that flips us back to idle.
-    turnIdle = false;
+    // Phase 4 / Phase 11 (H2): flip turnIdleRef.current=false BEFORE the
+    // inject lands. The SDK may take several seconds to start emitting
+    // tokens; in the meantime the next pushInterval tick must NOT inject
+    // again. `result` (turn fully ended) is the only event that flips us
+    // back to idle. Shared ref means /chat-stream also flips this site,
+    // and auto-tick respects /chat's flip.
+    turnIdleRef.current = false;
     args.agent.injectActivityContext(`<market_snapshot>${context}</market_snapshot>`);
     log.debug(
       `pushed market snapshot (${candidates.length} candidates, market=${market})`,
@@ -125,9 +167,10 @@ export function startAutoTick(args: CreateAutoTickArgs): AutoTickHandle {
     if (now - lastDecisionAt >= decisionMs && candidates.length > 0) {
       lastDecisionAt = now;
       // Decision injection also marks the turn busy — even though we just
-      // set turnIdle=false above for the snapshot, doing it again here
-      // documents that EVERY inject site is responsible for the flip.
-      turnIdle = false;
+      // set turnIdleRef.current=false above for the snapshot, doing it
+      // again here documents that EVERY inject site is responsible for the
+      // flip.
+      turnIdleRef.current = false;
       args.agent.injectUserMessage(
         "Market check. Based on the latest <market_snapshot> above and your memory:\n" +
           "- If any candidate meets your thesis bar, narrate your call and submit_trade.\n" +

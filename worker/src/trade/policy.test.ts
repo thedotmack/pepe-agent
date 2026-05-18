@@ -9,6 +9,7 @@
 import { describe, it, expect } from "bun:test";
 import {
   checkTradePolicy,
+  checkRouteLiquidity,
   type PolicyContext,
   type TradeIntent,
   PER_TRADE_MAX_SOL,
@@ -17,6 +18,7 @@ import {
   MAX_OPEN_POSITIONS,
   SLIPPAGE_HARD_CAP_BPS,
   TANK_EMPTY_THRESHOLD_SOL,
+  ROUTE_LIQUIDITY_MAX_PRICE_IMPACT,
 } from "./policy.ts";
 import type { TradeLedger } from "./ledger.ts";
 
@@ -306,6 +308,44 @@ describe("checkTradePolicy", () => {
     if (!r.allow) expect(r.reason).toMatch(/slippage/);
   });
 
+  // ─── Phase 11: max-open-positions is BUY-only (codex re-audit) ─────────
+  // Pre-Phase-11: gate denied BOTH BUY and SELL at MAX_OPEN_POSITIONS.
+  // That deadlocked emergency exits — when you're at cap you can never sell
+  // *because* you have positions to sell. Mirrors the TANK_EMPTY / cooldown
+  // pattern: BUYs are gated, SELLs always allowed when otherwise valid.
+
+  it("BUY: still denied at MAX_OPEN_POSITIONS (regression)", () => {
+    const r = checkTradePolicy(
+      validIntent,
+      ctx({
+        state: {
+          lastTradeMs: null,
+          totalSolToday: 0,
+          openPositionsCount: MAX_OPEN_POSITIONS,
+        },
+      })
+    );
+    expect(r.allow).toBe(false);
+    if (!r.allow) expect(r.reason).toMatch(/max open positions/);
+  });
+
+  it("SELL: allowed at MAX_OPEN_POSITIONS — emergency exit must bypass position cap", () => {
+    // Phase 11: a SELL at the position cap is exactly the case the cap
+    // exists to enable — exiting one of the open positions. Throttling
+    // here would deadlock the loop. Hard regression test.
+    const r = checkTradePolicy(
+      validSellIntent,
+      ctx({
+        state: {
+          lastTradeMs: null,
+          totalSolToday: 0,
+          openPositionsCount: MAX_OPEN_POSITIONS,
+        },
+      })
+    );
+    expect(r.allow).toBe(true);
+  });
+
   // ─── Phase 6: UNKNOWN balance state (audit finding #9) ─────────────────
   // The accessor returns `number | null`. `null` means RPC failed or the
   // poll never succeeded. UNKNOWN must deny BUYs (never fail open) but
@@ -369,5 +409,65 @@ describe("checkTradePolicy", () => {
       ctx({ walletSolBalance: () => 1.5 })
     );
     expect(r.allow).toBe(true);
+  });
+});
+
+// ─── Phase 11 (codex Phase 10 re-audit #3): route-liquidity gate ─────────
+// checkRouteLiquidity runs at the trade boundary in tools/index.ts to put
+// the auto-tick prefilter floor back when /chat steers a trade attempt at
+// an arbitrary mint. Pure function — no context, just the quote shape.
+
+describe("checkRouteLiquidity", () => {
+  it("allows a healthy quote with a route and low price impact", () => {
+    const r = checkRouteLiquidity({
+      routePlan: [{ swapInfo: { ammKey: "RaydiumXxX" } }],
+      priceImpactPct: "0.01",
+    });
+    expect(r.allow).toBe(true);
+  });
+
+  it("denies a quote with empty routePlan", () => {
+    // Jupiter found no route — submitting would either revert on-chain or
+    // burn lamports for nothing. Hard deny regardless of priceImpactPct.
+    const r = checkRouteLiquidity({
+      routePlan: [],
+      priceImpactPct: "0.0",
+    });
+    expect(r.allow).toBe(false);
+    if (!r.allow) expect(r.reason).toMatch(/route/i);
+  });
+
+  it("denies a quote with priceImpactPct above the hard ceiling", () => {
+    // Above 50% the pool is illiquid enough that executed price drifts wildly
+    // from quoted price — no BUY/SELL outcome is worth that.
+    const r = checkRouteLiquidity({
+      routePlan: [{}],
+      priceImpactPct: String(ROUTE_LIQUIDITY_MAX_PRICE_IMPACT + 0.01),
+    });
+    expect(r.allow).toBe(false);
+    if (!r.allow) expect(r.reason).toMatch(/priceImpactPct/);
+  });
+
+  it("allows a quote exactly at the hard ceiling (boundary)", () => {
+    // Strict `>` so exactly-50% is allowed. The position-monitor's softer
+    // 10% threshold is informational; the 50% ceiling is the structural
+    // deny line, and the boundary case should pass.
+    const r = checkRouteLiquidity({
+      routePlan: [{}],
+      priceImpactPct: String(ROUTE_LIQUIDITY_MAX_PRICE_IMPACT),
+    });
+    expect(r.allow).toBe(true);
+  });
+
+  it("denies a quote with non-numeric priceImpactPct", () => {
+    // Defensive: if Jupiter returns something we can't parse, refuse the
+    // trade rather than accept an unknown. Better one failed trade than a
+    // silent slippage event.
+    const r = checkRouteLiquidity({
+      routePlan: [{}],
+      priceImpactPct: "not-a-number",
+    });
+    expect(r.allow).toBe(false);
+    if (!r.allow) expect(r.reason).toMatch(/priceImpactPct/);
   });
 });

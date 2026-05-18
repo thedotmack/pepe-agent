@@ -5,6 +5,7 @@ import { createLogger } from "../logger.ts";
 import { tryGetPublicKey } from "../trade/wallet.ts";
 import type { StateStore, KillSwitchRef } from "../state.ts";
 import type { AgentLoopHandle } from "../agent/loop.ts";
+import type { TurnIdleRef } from "../agent/auto-tick.ts";
 import type { TradeLedger } from "../trade/ledger.ts";
 import { createChatStream } from "./chat-stream.ts";
 
@@ -28,10 +29,19 @@ export interface StartWorkerServerArgs {
    * state.ts:recordTradeResult since Phase 7).
    */
   ledger: TradeLedger;
+  /**
+   * Phase 11 (codex Phase 10 re-audit H2): shared turn-idle flag plumbed
+   * through to /chat handler so chat injections flip the same ref that
+   * auto-tick reads — preventing auto-tick from stacking a market_snapshot
+   * push on top of an in-flight chat turn. Optional: when the worker boots
+   * without ANTHROPIC_API_KEY (agent=null), no ref is needed because /chat
+   * returns 503 anyway.
+   */
+  turnIdleRef?: TurnIdleRef;
 }
 
 export function startWorkerServer(args: StartWorkerServerArgs): WorkerServerHandle {
-  const { stateStore, killSwitchRef, agent, ledger } = args;
+  const { stateStore, killSwitchRef, agent, ledger, turnIdleRef } = args;
   const startedAt = Date.now();
   const walletPubkey = tryGetPublicKey();
   const app = new Hono();
@@ -104,6 +114,9 @@ export function startWorkerServer(args: StartWorkerServerArgs): WorkerServerHand
       agent,
       userText: text,
       signal: c.req.raw.signal,
+      // Phase 11 (H2): shared with auto-tick. /chat flips this false; auto-
+      // tick respects it. Same instance, both call sites.
+      turnIdleRef,
     });
 
     return new Response(stream, {
