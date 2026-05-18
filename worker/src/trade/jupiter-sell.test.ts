@@ -63,7 +63,7 @@ mock.module("@solana/spl-token", () => ({
 // Stub the web3.js Connection so executeTrade's `new Connection(...)` returns
 // our fake. We don't care about RPC URL — just intercept the methods that
 // jupiter.ts calls during the sell happy path: signAndSend(connection) calls
-// sendRawTransaction + getLatestBlockhash + confirmTransaction.
+// sendRawTransaction + confirmTransaction + getSignatureStatus.
 const fakeBlockhash = {
   blockhash: "Fake1111111111111111111111111111111111111111",
   lastValidBlockHeight: 1_000_000,
@@ -78,6 +78,11 @@ class FakeConnection {
   }
   async confirmTransaction() {
     return { value: { err: null } };
+  }
+  async getSignatureStatus() {
+    return {
+      value: { err: null, confirmationStatus: "confirmed", slot: 1 },
+    };
   }
 }
 class FakePublicKey {
@@ -96,6 +101,9 @@ class FakePublicKey {
   }
 }
 class FakeVersionedTransaction {
+  // signAndSend reads `tx.message.recentBlockhash` to drive
+  // confirmTransaction — expose the same shape on the fake.
+  message = { recentBlockhash: fakeBlockhash.blockhash };
   static deserialize(_buf: Uint8Array) {
     return new FakeVersionedTransaction();
   }

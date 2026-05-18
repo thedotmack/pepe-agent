@@ -18,6 +18,7 @@ import {
   Connection,
   PublicKey,
   VersionedTransaction,
+  type SignatureStatus,
 } from "@solana/web3.js";
 // spl-token signatures sourced from @solana/spl-token@0.4 d.ts (no skill present).
 import {
@@ -26,7 +27,17 @@ import {
   TokenAccountNotFoundError,
 } from "@solana/spl-token";
 import { config } from "../config.ts";
+import { createLogger } from "../logger.ts";
 import { getKeypair, getPublicKey } from "./wallet.ts";
+
+const log = createLogger("trade.jupiter");
+
+/** How long to race confirmTransaction before giving up and polling status. */
+const CONFIRM_TIMEOUT_MS = 90_000;
+/** Interval between rebroadcasts of the signed tx while waiting for confirm. */
+const REBROADCAST_INTERVAL_MS = 2_000;
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 const JUP_BASE = "https://lite-api.jup.ag/swap/v1";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -81,10 +92,20 @@ export async function getQuote(args: {
   return (await res.json()) as QuoteResponse;
 }
 
+export interface SubmitSwapResult {
+  swapTransaction: string;
+  /** Block height at which the tx Jupiter signed becomes invalid. Used as
+   * the expiry signal for the post-send confirmation loop — DO NOT replace
+   * with a fresh getLatestBlockhash() call. */
+  lastValidBlockHeight: number;
+  /** Telemetry only — Jupiter's selected priority fee in lamports. */
+  prioritizationFeeLamports?: number;
+}
+
 export async function submitSwap(args: {
   quote: QuoteResponse;
   userPublicKey: string;
-}): Promise<{ swapTransaction: string }> {
+}): Promise<SubmitSwapResult> {
   const url = `${JUP_BASE}/swap`;
   const res = await fetch(url, {
     method: "POST",
@@ -99,40 +120,169 @@ export async function submitSwap(args: {
     const text = await res.text().catch(() => "<no-body>");
     throw new Error(`Jupiter swap ${res.status}: ${text}`);
   }
-  const json = (await res.json()) as { swapTransaction?: string };
+  const json = (await res.json()) as {
+    swapTransaction?: string;
+    lastValidBlockHeight?: number;
+    prioritizationFeeLamports?: number;
+  };
   if (!json.swapTransaction) {
     throw new Error("Jupiter swap response missing swapTransaction");
   }
-  return { swapTransaction: json.swapTransaction };
+  if (typeof json.lastValidBlockHeight !== "number") {
+    throw new Error("Jupiter swap response missing lastValidBlockHeight");
+  }
+  return {
+    swapTransaction: json.swapTransaction,
+    lastValidBlockHeight: json.lastValidBlockHeight,
+    prioritizationFeeLamports: json.prioritizationFeeLamports,
+  };
 }
 
+/** Outcome of a sign-and-send attempt, after the rebroadcast/confirm dance. */
+export type SignAndSendResult =
+  | { status: "ok"; txid: string }
+  | { status: "failed_onchain"; txid: string; err: unknown }
+  | { status: "not_landed"; txid: string }
+  | { status: "landed_after_timeout"; txid: string; value: SignatureStatus };
+
+// citation: pattern adapted from Jupiter station-app reference
+// `transactionSender.ts` — confirm against the blockhash that was signed
+// into the tx (recoverable from tx.message.recentBlockhash), and use
+// `lastValidBlockHeight` from the /swap response. Rebroadcast in a loop
+// instead of relying on RPC maxRetries.
 export async function signAndSend(
   swapTransactionBase64: string,
-  connection: Connection
-): Promise<{ txid: string }> {
+  connection: Connection,
+  lastValidBlockHeight: number,
+): Promise<SignAndSendResult> {
   const keypair = getKeypair();
   const buf = Buffer.from(swapTransactionBase64, "base64");
   const tx = VersionedTransaction.deserialize(buf);
   tx.sign([keypair]);
   const raw = tx.serialize();
+  // The blockhash the tx was signed against — required by the confirmation
+  // strategy. NEVER fetch a fresh one here, that defeats the expiry mechanism.
+  const blockhash = tx.message.recentBlockhash;
+
   const txid = await connection.sendRawTransaction(raw, {
-    skipPreflight: false,
+    skipPreflight: true,
     maxRetries: 0,
   });
-  // confirmTransaction on web3.js@1 accepts either a sig string (deprecated)
-  // or a `BlockheightBasedTransactionConfirmationStrategy`. Fetch a fresh
-  // blockhash for the strategy form so we don't get the deprecated-overload
-  // type error.
-  const latest = await connection.getLatestBlockhash("confirmed");
-  await connection.confirmTransaction(
+
+  const abortController = new AbortController();
+  const confirmPromise = connection.confirmTransaction(
     {
       signature: txid,
-      blockhash: latest.blockhash,
-      lastValidBlockHeight: latest.lastValidBlockHeight,
+      blockhash,
+      lastValidBlockHeight,
+      abortSignal: abortController.signal,
     },
-    "confirmed"
+    "confirmed",
   );
-  return { txid };
+
+  // Background rebroadcast loop — keeps the tx in the leader's mempool while
+  // we wait for confirmation. Errors are swallowed; confirmation drives the
+  // outcome. Returns when the abort signal fires.
+  const rebroadcastPromise = (async () => {
+    while (!abortController.signal.aborted) {
+      await sleep(REBROADCAST_INTERVAL_MS);
+      if (abortController.signal.aborted) return;
+      try {
+        await connection.sendRawTransaction(raw, {
+          skipPreflight: true,
+          maxRetries: 0,
+        });
+      } catch {
+        // swallow — confirmation drives outcome
+      }
+    }
+  })();
+
+  // Race confirm against a hard timeout so a stuck blockhash-expiry RPC
+  // never wedges the agent. The timeout case falls through to a final
+  // getSignatureStatus poll.
+  const TIMEOUT_SENTINEL = Symbol("confirm-timeout");
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<typeof TIMEOUT_SENTINEL>((resolve) => {
+    timeoutHandle = setTimeout(() => resolve(TIMEOUT_SENTINEL), CONFIRM_TIMEOUT_MS);
+  });
+
+  let confirmOutcome:
+    | { kind: "resolved"; value: Awaited<typeof confirmPromise> }
+    | { kind: "rejected"; err: unknown }
+    | { kind: "timeout" };
+  try {
+    const winner = await Promise.race([
+      confirmPromise.then(
+        (value) => ({ kind: "resolved" as const, value }),
+        (err) => ({ kind: "rejected" as const, err }),
+      ),
+      timeoutPromise,
+    ]);
+    confirmOutcome =
+      winner === TIMEOUT_SENTINEL ? { kind: "timeout" } : winner;
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    abortController.abort();
+    // Surface unexpected errors from the rebroadcast loop but don't block.
+    rebroadcastPromise.catch((err) => {
+      log.warn(`rebroadcast loop errored: ${String(err)}`);
+    });
+  }
+
+  if (confirmOutcome.kind === "resolved") {
+    const value = confirmOutcome.value?.value;
+    if (value?.err) {
+      log.warn(`tx ${txid} failed on-chain: ${JSON.stringify(value.err)}`);
+      return { status: "failed_onchain", txid, err: value.err };
+    }
+    // Sanity reconciliation — confirmTransaction said success, double-check
+    // via getSignatureStatus. A null status here is surprising but not
+    // fatal; log and accept the confirm verdict.
+    try {
+      const status = await connection.getSignatureStatus(txid, {
+        searchTransactionHistory: true,
+      });
+      if (!status.value || !status.value.confirmationStatus) {
+        log.warn(
+          `tx ${txid} confirmed but getSignatureStatus returned ${JSON.stringify(status.value)}`,
+        );
+      }
+    } catch (err) {
+      log.warn(`getSignatureStatus reconciliation failed for ${txid}: ${String(err)}`);
+    }
+    return { status: "ok", txid };
+  }
+
+  // Either confirmTransaction rejected (commonly BlockheightExceededError)
+  // or our hard timeout fired. In both cases we poll on-chain reality once
+  // more before declaring the trade lost.
+  if (confirmOutcome.kind === "rejected") {
+    log.warn(
+      `confirmTransaction rejected for ${txid}: ${String(confirmOutcome.err)}; polling status`,
+    );
+  } else {
+    log.warn(`confirmTransaction timeout for ${txid} after ${CONFIRM_TIMEOUT_MS}ms; polling status`);
+  }
+  let finalStatus: Awaited<ReturnType<Connection["getSignatureStatus"]>>;
+  try {
+    finalStatus = await connection.getSignatureStatus(txid, {
+      searchTransactionHistory: true,
+    });
+  } catch (err) {
+    log.error(`getSignatureStatus poll failed for ${txid}: ${String(err)}`);
+    return { status: "not_landed", txid };
+  }
+  const value = finalStatus.value;
+  if (!value) {
+    return { status: "not_landed", txid };
+  }
+  if (value.err) {
+    return { status: "failed_onchain", txid, err: value.err };
+  }
+  // Landed late — caller decides whether to record. Keep the full
+  // SignatureStatus on the result so downstream can read confirmationStatus.
+  return { status: "landed_after_timeout", txid, value };
 }
 
 export type ExecuteTradeArgs = {
@@ -155,6 +305,22 @@ export type ExecuteTradeResult =
   | {
       status: "no_token_account";
       reason: string;
+    }
+  | {
+      status: "failed_onchain";
+      txid: string;
+      err: unknown;
+    }
+  | {
+      status: "not_landed";
+      txid: string;
+    }
+  | {
+      status: "landed_after_timeout";
+      txid: string;
+      value: SignatureStatus;
+      executedPriceSolPerToken: number | null;
+      quote: QuoteResponse;
     };
 
 /**
@@ -243,13 +409,18 @@ export async function executeTrade(
     slippageBps: args.slippageBps,
   });
 
-  const { swapTransaction } = await submitSwap({ quote, userPublicKey });
-  const { txid } = await signAndSend(swapTransaction, connection);
+  const { swapTransaction, lastValidBlockHeight } = await submitSwap({
+    quote,
+    userPublicKey,
+  });
+  const sendResult = await signAndSend(swapTransaction, connection, lastValidBlockHeight);
 
   // For BUY: inAmount = lamports spent, outAmount = atomic tokens received →
   //   SOL per atomic-token = inLamports/1e9 / outAtomic.
   // For SELL: inAmount = atomic tokens sold, outAmount = lamports received →
   //   SOL per atomic-token = outLamports/1e9 / inAtomic.
+  // NOTE: Phase 3 owns the atomic-vs-UI fix for this math; leaving the
+  // formula intact here so Phase 3's refactor target stays obvious.
   const inAmt = Number(quote.inAmount);
   const outAmt = Number(quote.outAmount);
   let executedPriceSolPerToken: number | null = null;
@@ -259,5 +430,29 @@ export async function executeTrade(
       : outAmt / 1e9 / inAmt;
   }
 
-  return { status: "ok", txid, executedPriceSolPerToken, quote };
+  switch (sendResult.status) {
+    case "ok":
+      return {
+        status: "ok",
+        txid: sendResult.txid,
+        executedPriceSolPerToken,
+        quote,
+      };
+    case "failed_onchain":
+      return {
+        status: "failed_onchain",
+        txid: sendResult.txid,
+        err: sendResult.err,
+      };
+    case "not_landed":
+      return { status: "not_landed", txid: sendResult.txid };
+    case "landed_after_timeout":
+      return {
+        status: "landed_after_timeout",
+        txid: sendResult.txid,
+        value: sendResult.value,
+        executedPriceSolPerToken,
+        quote,
+      };
+  }
 }

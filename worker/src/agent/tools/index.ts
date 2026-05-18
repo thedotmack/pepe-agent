@@ -249,6 +249,10 @@ export function createPepeMcpServer(
 
       let txid: string;
       let executedPriceSolPerToken: number | null;
+      // landedLate is true only on the "landed_after_timeout" path — caller
+      // records the trade and closes the position (it did land) but notes
+      // the late-landing in the reason for downstream reconciliation.
+      let landedLate = false;
       try {
         const result = await executeTrade(
           side === "BUY"
@@ -265,22 +269,79 @@ export function createPepeMcpServer(
                 slippageBps: input.slippageBps,
               },
         );
-        if (result.status !== "ok") {
-          log.warn(`submit_trade non-ok status: ${result.status} ${result.reason}`);
-          stateStore.recordDecision({
-            ts: Date.now(),
-            symbol: input.tokenIn.slice(0, 8),
-            action: "PASS",
-            reason: `${result.status}: ${result.reason}`,
-          });
-          stateStore.setPhase("WATCHING");
-          return {
-            content: [{ type: "text", text: `${result.status}: ${result.reason}` }],
-            isError: true,
-          };
+        switch (result.status) {
+          case "ok":
+            txid = result.txid;
+            executedPriceSolPerToken = result.executedPriceSolPerToken;
+            break;
+          case "landed_after_timeout":
+            // Tx landed on-chain but confirmTransaction missed it. Record
+            // the trade + close the position (the on-chain effect happened)
+            // and flag it for human-reviewable reconciliation.
+            log.warn(
+              `submit_trade landed_after_timeout txid=${result.txid} status=${JSON.stringify(result.value)}`,
+            );
+            txid = result.txid;
+            executedPriceSolPerToken = result.executedPriceSolPerToken;
+            landedLate = true;
+            break;
+          case "no_token_account": {
+            log.warn(`submit_trade no_token_account: ${result.reason}`);
+            stateStore.recordDecision({
+              ts: Date.now(),
+              symbol: input.tokenIn.slice(0, 8),
+              action: "PASS",
+              reason: `no_token_account: ${result.reason}`,
+            });
+            stateStore.setPhase("WATCHING");
+            return {
+              content: [
+                { type: "text", text: `execute-failed: no_token_account: ${result.reason}` },
+              ],
+              isError: true,
+            };
+          }
+          case "failed_onchain": {
+            log.warn(
+              `submit_trade failed_onchain txid=${result.txid} err=${JSON.stringify(result.err)}`,
+            );
+            stateStore.recordDecision({
+              ts: Date.now(),
+              symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+              action: "PASS",
+              reason: `failed_onchain ${result.txid}: ${JSON.stringify(result.err)}`,
+            });
+            stateStore.setPhase("WATCHING");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `execute-failed: tx ${result.txid} failed on-chain (${JSON.stringify(result.err)})`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          case "not_landed": {
+            log.warn(`submit_trade not_landed txid=${result.txid}`);
+            stateStore.recordDecision({
+              ts: Date.now(),
+              symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+              action: "PASS",
+              reason: `not_landed ${result.txid}`,
+            });
+            stateStore.setPhase("WATCHING");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `execute-failed: tx ${result.txid} did not land within timeout`,
+                },
+              ],
+              isError: true,
+            };
+          }
         }
-        txid = result.txid;
-        executedPriceSolPerToken = result.executedPriceSolPerToken;
       } catch (err) {
         log.error(`submit_trade execute failed: ${String(err)}`);
         stateStore.recordDecision({
@@ -298,6 +359,12 @@ export function createPepeMcpServer(
         };
       }
 
+      // landedLate paths annotate the trade row so a human can reconcile
+      // later — the tx did land, but confirmation arrived past our 90s
+      // window, so price + slippage might be staler than usual.
+      const recordReason = landedLate
+        ? `${input.reason} [landed-after-timeout: reconcile]`
+        : input.reason;
       try {
         if (side === "BUY") {
           if (!ledger.hasTradeTxid(txid)) {
@@ -308,7 +375,7 @@ export function createPepeMcpServer(
               amountSol: input.amountSol as number,
               txid,
               executedPriceSolPerToken,
-              reason: input.reason,
+              reason: recordReason,
             });
           }
           ledger.openPosition({
@@ -321,13 +388,14 @@ export function createPepeMcpServer(
             ts: Date.now(),
             symbol: input.tokenOut.slice(0, 8),
             action: "BUY",
-            reason: input.reason,
+            reason: recordReason,
           });
           stateStore.setSelectedToken(input.tokenOut);
         } else {
           // SELL: record trade row, then close the position. The position is
-          // keyed by mint (tokenId == tokenIn for SELL). On-chain confirmation
-          // already succeeded (status === "ok") above.
+          // keyed by mint (tokenId == tokenIn for SELL). On-chain
+          // confirmation succeeded above (status === "ok" or
+          // "landed_after_timeout").
           if (!ledger.hasTradeTxid(txid)) {
             ledger.recordTrade({
               tokenIn: input.tokenIn,
@@ -338,7 +406,7 @@ export function createPepeMcpServer(
               amountSol: 0,
               txid,
               executedPriceSolPerToken,
-              reason: input.reason,
+              reason: recordReason,
             });
           }
           ledger.closePosition(input.tokenIn);
@@ -347,7 +415,7 @@ export function createPepeMcpServer(
             ts: Date.now(),
             symbol: input.tokenIn.slice(0, 8),
             action: "SELL",
-            reason: input.reason,
+            reason: recordReason,
           });
           stateStore.setSelectedToken(null);
         }
