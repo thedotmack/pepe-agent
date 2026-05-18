@@ -59,6 +59,9 @@ function fakeLedger(): TradeLedger & { phaseEvents: PhaseEventRow[] } {
     openPositions: () => [],
     openPosition: () => {},
     setPositionDecimals: () => {},
+    // Phase 10 (#1): TradeLedger now requires setPositionTokensReceived for
+    // backfilling legacy rows; state tests don't exercise it, inert noop.
+    setPositionTokensReceived: () => {},
     closePosition: () => {},
     recordPhaseEvent: (input) => {
       phaseEvents.push({

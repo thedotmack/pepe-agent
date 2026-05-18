@@ -301,6 +301,11 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
 
       let txid: string;
       let executedPriceSolPerToken: number | null;
+      // Phase 10 (#1): track the exact uint64 of non-SOL tokens received on a
+      // BUY so the position row stores the real on-chain quantity instead of
+      // an approximation. Read from quote.outAmount on the "ok" /
+      // "landed_after_timeout" branches; ignored on SELL.
+      let tokensReceivedAtomic: bigint = 0n;
       // landedLate is true only on the "landed_after_timeout" path — caller
       // records the trade and closes the position (it did land) but notes
       // the late-landing in the reason for downstream reconciliation.
@@ -332,6 +337,21 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
           case "ok":
             txid = result.txid;
             executedPriceSolPerToken = result.executedPriceSolPerToken;
+            // Phase 10 (#1): quote.outAmount on a BUY is the exact uint64 of
+            // non-SOL tokens received. Parse via BigInt (string-safe; never
+            // through Number which would round at 2^53). Set only on BUY —
+            // SELL's outAmount is lamports, not the token we're holding.
+            if (side === "BUY") {
+              try {
+                tokensReceivedAtomic = BigInt(result.quote.outAmount);
+              } catch {
+                // Malformed quote field — leave as 0n so the row stores '0'
+                // and position-monitor's lazy backfill recovers from ATA.
+                log.warn(
+                  `submit_trade quote.outAmount not bigint-parseable: ${String(result.quote.outAmount)}; deferring to ATA backfill`,
+                );
+              }
+            }
             break;
           case "landed_after_timeout":
             // Tx landed on-chain but confirmTransaction missed it. Record
@@ -342,6 +362,18 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
             );
             txid = result.txid;
             executedPriceSolPerToken = result.executedPriceSolPerToken;
+            // Phase 10 (#1): same as "ok" — the tx did land, so the quote's
+            // outAmount is what we received. Reconcile-flagged in the trade
+            // reason but the on-chain effect is real.
+            if (side === "BUY") {
+              try {
+                tokensReceivedAtomic = BigInt(result.quote.outAmount);
+              } catch {
+                log.warn(
+                  `submit_trade quote.outAmount not bigint-parseable (late): ${String(result.quote.outAmount)}; deferring to ATA backfill`,
+                );
+              }
+            }
             landedLate = true;
             break;
           case "no_token_account": {
@@ -417,23 +449,38 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
             };
           }
           case "not_landed": {
-            log.warn(`submit_trade not_landed txid=${result.txid}`);
+            // Phase 10 (codex re-audit #5): pre-send-abort returns txid=null
+            // with reason="aborted before send"; post-send-timeout returns a
+            // real txid. The decision log + trade-result narrate both cases
+            // so a reviewer can tell from /phase-events whether the kill
+            // switch caught us in time or whether the tx is sitting
+            // somewhere on the wire.
+            const txLabel = result.txid ?? "<not-sent>";
+            const reasonLabel = result.reason
+              ? `${result.reason} (${txLabel})`
+              : `not_landed ${txLabel}`;
+            log.warn(`submit_trade not_landed txid=${txLabel} reason=${result.reason ?? "(post-send timeout)"}`);
             stateStore.recordDecision({
               ts: Date.now(),
               symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
               action: "PASS",
-              reason: `not_landed ${result.txid}`,
+              reason: reasonLabel,
             });
-            stateStore.recordTradeResult(`not_landed ${result.txid}`, {
+            stateStore.recordTradeResult(reasonLabel, {
               side,
-              txid: result.txid,
+              // Only attach txid when we actually broadcast. A null txid
+              // here would otherwise pollute the phase_events row with a
+              // signature that doesn't exist on-chain.
+              ...(result.txid ? { txid: result.txid } : {}),
               outcome: "not_landed",
             });
             return {
               content: [
                 {
                   type: "text",
-                  text: `execute-failed: tx ${result.txid} did not land within timeout`,
+                  text: result.txid
+                    ? `execute-failed: tx ${result.txid} did not land within timeout`
+                    : `execute-failed: ${result.reason ?? "aborted before send"} (no tx broadcast)`,
                 },
               ],
               isError: true,
@@ -493,6 +540,10 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
             entryPriceSolPerToken: executedPriceSolPerToken ?? 0,
             sizeSol: input.amountSol as number,
             decimals: mintDecimals as number,
+            // Phase 10 (#1): persist the exact uint64 received so the SELL
+            // path can size exits precisely, instead of inferring tokens =
+            // sizeSol / entryPrice (slippage-corrupted).
+            tokensReceivedAtomic,
           });
 
           stateStore.recordDecision({

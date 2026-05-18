@@ -28,8 +28,14 @@ import type { StateStore } from "../state.ts";
 import { defaultRpcUrl, getQuote } from "../trade/jupiter.ts";
 import { Connection, LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
 // citation: @solana/spl-token@0.4 — getMint(connection, mintPk) returns
-// MintInfo with `.decimals: number`. Used only on legacy-row backfill.
-import { getMint } from "@solana/spl-token";
+// MintInfo with `.decimals: number`. getAccount(connection, ata) returns
+// `.amount: bigint`. Both used only on legacy-row backfill.
+import {
+  getMint,
+  getAssociatedTokenAddressSync,
+  getAccount,
+} from "@solana/spl-token";
+import { getPublicKey } from "../trade/wallet.ts";
 import { createLogger } from "../logger.ts";
 
 const log = createLogger("agent.position-monitor");
@@ -106,6 +112,32 @@ export function startPositionMonitor(
             } catch (err) {
               log.warn(`getMint backfill failed for ${pos.tokenId}: ${String(err)}`);
               continue;
+            }
+          }
+
+          // Phase 10 (#1): legacy rows opened before the
+          // tokensReceivedAtomic column have the SQL default '0'. Backfill
+          // from the on-chain ATA so the agent sees the real balance the
+          // next time it reads get_open_positions. Best-effort — a failure
+          // here does NOT skip the tick (price math still works), it just
+          // delays the backfill to the next interval.
+          if (pos.tokensReceivedAtomic === "0") {
+            try {
+              const rpc = new Connection(defaultRpcUrl(), "confirmed");
+              const ownerPk = new PublicKey(getPublicKey());
+              const ata = getAssociatedTokenAddressSync(
+                new PublicKey(pos.tokenId),
+                ownerPk,
+              );
+              const acct = await getAccount(rpc, ata);
+              args.ledger.setPositionTokensReceived(pos.tokenId, acct.amount);
+              log.info(
+                `backfilled tokensReceivedAtomic=${acct.amount.toString()} for ${pos.tokenId}`,
+              );
+            } catch (err) {
+              log.warn(
+                `tokensReceivedAtomic backfill failed for ${pos.tokenId}: ${String(err)}`,
+              );
             }
           }
 

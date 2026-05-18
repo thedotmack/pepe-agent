@@ -61,7 +61,20 @@ async function main() {
   // value). The policy distinguishes null (UNKNOWN, deny BUY) from a low
   // numeric value (TANK_EMPTY). Audit finding #9: do not default to 0 or
   // Infinity — both silently hide RPC outages.
+  //
+  // Phase 10 (codex re-audit #9): cached balance also carries an "as-of"
+  // timestamp. If the last successful refresh is older than BALANCE_TTL_MS,
+  // the accessor returns null so the policy treats us as UNKNOWN and stops
+  // BUYing on a stale snapshot. The default 120s TTL is 4× the 30s poll —
+  // gives RPC a few consecutive failures to recover before we deny BUYs.
   let walletSolCached: number | null = null;
+  let walletSolCachedAt: number | null = null;
+  const BALANCE_TTL_MS = 120_000;
+  // Phase 10: 10s hard ceiling around getBalance. Connection has its own
+  // internal timeout but it's per-HTTP-attempt, not per-overall-await; if
+  // the RPC is flaky enough to retry, the await can outlive the poll
+  // interval and pile up. Promise.race against AbortSignal.timeout bounds it.
+  const BALANCE_RPC_TIMEOUT_MS = 10_000;
   let balancePoll: ReturnType<typeof setInterval> | null = null;
   if (walletPubkey) {
     try {
@@ -77,12 +90,37 @@ async function main() {
         const rpc = new Connection(rpcUrl, "confirmed");
         const refreshBalance = async () => {
           try {
-            const lamports = await rpc.getBalance(pubkey, "confirmed");
+            // Phase 10 (codex re-audit #7/#9): Connection.getBalance has an
+            // internal HTTP timeout but the overall await is unbounded if it
+            // retries. Race against AbortSignal.timeout so a hung RPC can't
+            // wedge the poll loop or stall the next refresh.
+            const lamports = await Promise.race([
+              rpc.getBalance(pubkey, "confirmed"),
+              new Promise<number>((_, reject) => {
+                const signal = AbortSignal.timeout(BALANCE_RPC_TIMEOUT_MS);
+                signal.addEventListener(
+                  "abort",
+                  () =>
+                    reject(
+                      new Error(
+                        `getBalance timeout after ${BALANCE_RPC_TIMEOUT_MS}ms`,
+                      ),
+                    ),
+                  { once: true },
+                );
+              }),
+            ]);
             walletSolCached = lamports / LAMPORTS_PER_SOL;
+            // Phase 10: stamp the as-of so a later stale-TTL check can
+            // demote the cached value back to UNKNOWN if RPC stays down.
+            walletSolCachedAt = Date.now();
           } catch (err) {
             // Intentionally do NOT reset walletSolCached here. If we had a
             // good value, keep it; if we never had one, null persists and
             // the policy denies BUYs until RPC recovers.
+            // Phase 10: also do NOT bump walletSolCachedAt — the value is
+            // unchanged, but its as-of timestamp must remain pinned to the
+            // last *successful* refresh so the TTL check can evict.
             log.warn(`balance fetch failed: ${String(err)}`);
           }
         };
@@ -108,6 +146,17 @@ async function main() {
     }
   }
 
+  // Phase 10 (codex re-audit #9): shared TTL-aware accessor. Returns null
+  // (UNKNOWN) when the cache has gone stale — RPC has been down longer than
+  // BALANCE_TTL_MS so the policy/UI must NOT trust the last known good.
+  // Single accessor so the policy gate and the UI snapshot agree on what
+  // "stale" means.
+  const getWalletSolBalanceWithTtl = (): number | null => {
+    if (walletSolCached === null || walletSolCachedAt === null) return null;
+    if (Date.now() - walletSolCachedAt > BALANCE_TTL_MS) return null;
+    return walletSolCached;
+  };
+
   const stateStore = createStateStore({
     ledger,
     killSwitchRef,
@@ -118,7 +167,9 @@ async function main() {
     // The policy gate consumes the same source via the loop's
     // getWalletSolBalance closure (also nullable). Audit finding #9, Phase
     // 8 (O3) widens the snapshot surface to match the policy surface.
-    balanceProvider: () => walletSolCached,
+    // Phase 10: also gated by TTL so a hours-old cached value stops looking
+    // fresh once we've lost RPC for >120s.
+    balanceProvider: getWalletSolBalanceWithTtl,
   });
 
   // claude-mem client. Health-check on boot but never crash if it's down —
@@ -181,7 +232,10 @@ async function main() {
         memClient,
         contentSessionId,
         stateStore,
-        getWalletSolBalance: (): number | null => walletSolCached,
+        // Phase 10: same TTL-aware accessor as the UI snapshot. Policy
+        // denies BUY when balance is UNKNOWN; stale cache must demote to
+        // UNKNOWN so we don't BUY on a balance that was true 30min ago.
+        getWalletSolBalance: getWalletSolBalanceWithTtl,
       });
       agent.emitter.on("assistantText", (text: string) => {
         log.info(`[agent] ${text.slice(0, 200)}`);

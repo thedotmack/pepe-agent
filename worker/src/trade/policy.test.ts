@@ -46,9 +46,14 @@ function fakeLedger(state: FakeLedgerState): TradeLedger {
         sizeSol: 0.05,
         openedAt: 0,
         decimals: 6,
+        // Phase 10 (#1): TradeLedger now exposes the exact uint64 of tokens
+        // received at entry. Test fakes return '0' (legacy backfill marker)
+        // because the policy tests don't exercise the SELL-sizing path.
+        tokensReceivedAtomic: "0",
       })),
     openPosition: () => {},
     setPositionDecimals: () => {},
+    setPositionTokensReceived: () => {},
     closePosition: () => {},
     // Phase 7 H4: policy never writes to phase_events, so these are inert
     // for the policy tests. Included to satisfy the TradeLedger interface.
@@ -259,10 +264,30 @@ describe("checkTradePolicy", () => {
     if (!r.allow) expect(r.reason).toMatch(/no wallet/);
   });
 
-  it("SELL: still denied during cooldown", () => {
+  it("SELL: allowed during cooldown — emergency exits bypass cooldown gate (Phase 10)", () => {
+    // Phase 10 (codex re-audit #13): cooldown is a BUY-only rate-limit. A
+    // SELL is an emergency exit; throttling it would mean a TP/SL/RUG signal
+    // gets stuck behind 30s of dead air while the position bleeds. Mirrors
+    // the TANK_EMPTY / per-trade / daily-cap pattern: BUYs are gated, SELLs
+    // are always allowed when the trade is structurally valid.
     const now = 1_000_000_000;
     const r = checkTradePolicy(
       validSellIntent,
+      ctx({
+        now: () => now,
+        state: { lastTradeMs: now - COOLDOWN_MS + 5_000, totalSolToday: 0, openPositionsCount: 0 },
+      })
+    );
+    expect(r.allow).toBe(true);
+  });
+
+  it("BUY: still denied during cooldown (regression — preserve existing rate-limit)", () => {
+    // Companion to the SELL-during-cooldown test above: the BUY cooldown
+    // gate must keep firing. Adding the BUY-only guard to the cooldown
+    // section must NOT relax the existing per-buy rate-limit.
+    const now = 1_000_000_000;
+    const r = checkTradePolicy(
+      validIntent,
       ctx({
         now: () => now,
         state: { lastTradeMs: now - COOLDOWN_MS + 5_000, totalSolToday: 0, openPositionsCount: 0 },

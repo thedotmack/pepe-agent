@@ -52,6 +52,19 @@ export interface TradeLedger {
     sizeSol: number;
     openedAt: number;
     decimals: number;
+    /**
+     * Phase 10 (codex re-audit #1): exact atomic uint64 of the non-SOL token
+     * received at entry (quote.outAmount on the BUY). Stored as a base-10
+     * string because SQLite REAL can't represent every u64 losslessly and a
+     * future Token-2022 mint might emit values past 2^53. The agent reads
+     * this verbatim to size SELLs, instead of approximating from sizeSol /
+     * entryPriceSolPerToken (which drifts with entry slippage).
+     *
+     * Legacy positions opened before this column gets a string "0" via
+     * SQLite's ALTER … DEFAULT; position-monitor backfills on first read by
+     * querying the ATA, similar to the Phase 3 decimals backfill.
+     */
+    tokensReceivedAtomic: string;
   }>;
   openPosition(input: {
     tokenId: string;
@@ -59,6 +72,13 @@ export interface TradeLedger {
     entryPriceSolPerToken: number;
     sizeSol: number;
     decimals: number;
+    /**
+     * Phase 10 (#1): caller passes the exact uint64 of tokens received from
+     * the BUY's quote.outAmount. Optional only because mark_position has no
+     * way to know the on-chain amount up front; that path stores "0" and
+     * lets the lazy ATA backfill fill it in.
+     */
+    tokensReceivedAtomic?: bigint;
   }): void;
   /**
    * Backfill decimals for a legacy position row that was opened before the
@@ -66,6 +86,13 @@ export interface TradeLedger {
    * position-monitor when it has to lazy-fetch getMint for the first tick.
    */
   setPositionDecimals(tokenId: string, decimals: number): void;
+  /**
+   * Phase 10 (#1) backfill for tokensReceivedAtomic on a legacy row. Mirrors
+   * setPositionDecimals; position-monitor calls this on first read when the
+   * row stores "0" but the ATA holds a real balance. bigint→TEXT to avoid
+   * SQLite REAL losing precision on large u64 values.
+   */
+  setPositionTokensReceived(tokenId: string, atomic: bigint): void;
   closePosition(tokenId: string): void;
   /**
    * Phase 7 H4: persist a structured trade-result event. Until this method
@@ -137,7 +164,11 @@ CREATE TABLE IF NOT EXISTS positions (
   sizeSol REAL NOT NULL,
   openedAt INTEGER NOT NULL,
   closedAt INTEGER,
-  decimals INTEGER NOT NULL DEFAULT 9
+  decimals INTEGER NOT NULL DEFAULT 9,
+  -- Phase 10 (#1): exact uint64 of non-SOL token received at BUY entry,
+  -- stored as TEXT so we never lose precision through SQLite's REAL. Legacy
+  -- rows backfill on first position-monitor tick via getAccount(ata).
+  tokensReceivedAtomic TEXT NOT NULL DEFAULT '0'
 );
 -- Phase 7 H4: structured trade-result audit log. Each row is one
 -- recordTradeResult() event from state.ts (denied_policy, ok, failed_onchain,
@@ -172,6 +203,21 @@ function migratePositionsDecimals(db: Database): void {
   }
 }
 
+// Phase 10 (#1): same PRAGMA pattern as decimals — gate the ALTER so a
+// second boot doesn't duplicate-column-error. Default '0' marks legacy rows;
+// position-monitor's first tick backfills via getAccount(ata).
+function migratePositionsTokensReceived(db: Database): void {
+  const cols = db.prepare(`PRAGMA table_info(positions)`).all() as Array<{
+    name: string;
+  }>;
+  const hasCol = cols.some((c) => c.name === "tokensReceivedAtomic");
+  if (!hasCol) {
+    db.exec(
+      `ALTER TABLE positions ADD COLUMN tokensReceivedAtomic TEXT NOT NULL DEFAULT '0'`,
+    );
+  }
+}
+
 export function openLedger(): TradeLedger {
   const dir = pickDbDir();
   const dbPath = path.join(dir, "trades.db");
@@ -179,6 +225,7 @@ export function openLedger(): TradeLedger {
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec(SCHEMA_SQL);
   migratePositionsDecimals(db);
+  migratePositionsTokensReceived(db);
 
   const insertTrade = db.prepare(
     `INSERT INTO trades (ts, tokenIn, tokenOut, side, amountSol, txid, executedPriceSolPerToken, reason)
@@ -196,24 +243,31 @@ export function openLedger(): TradeLedger {
       WHERE side = 'BUY' AND ts >= $since`
   );
   const openPositionsStmt = db.prepare(
-    `SELECT tokenId, symbol, entryPriceSolPerToken, sizeSol, openedAt, decimals
+    `SELECT tokenId, symbol, entryPriceSolPerToken, sizeSol, openedAt, decimals, tokensReceivedAtomic
        FROM positions
       WHERE closedAt IS NULL
       ORDER BY openedAt ASC`
   );
+  // Phase 10 (#1): tokensReceivedAtomic is stored as TEXT (uint64-safe).
+  // Caller's bigint is stringified before binding; legacy '0' default
+  // means "backfill on first read".
   const upsertPositionStmt = db.prepare(
-    `INSERT INTO positions (tokenId, symbol, entryPriceSolPerToken, sizeSol, openedAt, closedAt, decimals)
-     VALUES ($tokenId, $symbol, $entryPriceSolPerToken, $sizeSol, $openedAt, NULL, $decimals)
+    `INSERT INTO positions (tokenId, symbol, entryPriceSolPerToken, sizeSol, openedAt, closedAt, decimals, tokensReceivedAtomic)
+     VALUES ($tokenId, $symbol, $entryPriceSolPerToken, $sizeSol, $openedAt, NULL, $decimals, $tokensReceivedAtomic)
      ON CONFLICT(tokenId) DO UPDATE SET
        symbol = excluded.symbol,
        entryPriceSolPerToken = excluded.entryPriceSolPerToken,
        sizeSol = excluded.sizeSol,
        openedAt = excluded.openedAt,
        decimals = excluded.decimals,
+       tokensReceivedAtomic = excluded.tokensReceivedAtomic,
        closedAt = NULL`
   );
   const setDecimalsStmt = db.prepare(
     `UPDATE positions SET decimals = $decimals WHERE tokenId = $tokenId`
+  );
+  const setTokensReceivedStmt = db.prepare(
+    `UPDATE positions SET tokensReceivedAtomic = $tokensReceivedAtomic WHERE tokenId = $tokenId`
   );
   const closePositionStmt = db.prepare(
     `UPDATE positions SET closedAt = $closedAt WHERE tokenId = $tokenId AND closedAt IS NULL`
@@ -268,6 +322,7 @@ export function openLedger(): TradeLedger {
         sizeSol: number;
         openedAt: number;
         decimals: number;
+        tokensReceivedAtomic: string;
       }>;
     },
     openPosition(input) {
@@ -278,10 +333,20 @@ export function openLedger(): TradeLedger {
         $sizeSol: input.sizeSol,
         $openedAt: Date.now(),
         $decimals: input.decimals,
+        // Phase 10 (#1): bigint→TEXT for u64 safety. Absent on manual
+        // mark_position path → store '0' so position-monitor's first tick
+        // triggers the ATA backfill via setPositionTokensReceived.
+        $tokensReceivedAtomic: (input.tokensReceivedAtomic ?? 0n).toString(),
       });
     },
     setPositionDecimals(tokenId, decimals) {
       setDecimalsStmt.run({ $tokenId: tokenId, $decimals: decimals });
+    },
+    setPositionTokensReceived(tokenId, atomic) {
+      setTokensReceivedStmt.run({
+        $tokenId: tokenId,
+        $tokensReceivedAtomic: atomic.toString(),
+      });
     },
     closePosition(tokenId) {
       closePositionStmt.run({

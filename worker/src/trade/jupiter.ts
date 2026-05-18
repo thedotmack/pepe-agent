@@ -40,6 +40,15 @@ export const CONFIRM_TIMEOUT_MS = 90_000;
 /** Interval between rebroadcasts of the signed tx while waiting for confirm.
  *  Exported for the same reason as CONFIRM_TIMEOUT_MS. */
 export const REBROADCAST_INTERVAL_MS = 2_000;
+/**
+ * Hard ceiling for any single HTTP request to Jupiter. Bare `fetch()` has no
+ * default timeout; a hung connection (DNS stall, half-open TCP, GFW-style
+ * blackhole) would otherwise wedge the position monitor's setInterval body
+ * and every downstream caller. 10s is long enough for Jupiter on a bad day
+ * and short enough that a TP/SL signal can still fire on the next tick if
+ * one quote stalls. Phase 10 (codex re-audit #7).
+ */
+export const JUP_FETCH_TIMEOUT_MS = 10_000;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -88,7 +97,11 @@ export async function getQuote(args: {
     slippageBps: String(args.slippageBps),
   });
   const url = `${JUP_BASE}/quote?${params.toString()}`;
-  const res = await fetch(url);
+  // Phase 10 (codex re-audit #7): bare fetch has no default timeout, so a
+  // hung Jupiter connection would block position-monitor's poll loop forever.
+  // AbortSignal.timeout rejects the request with TimeoutError after the
+  // ceiling — bounded latency at the cost of one extra error path.
+  const res = await fetch(url, { signal: AbortSignal.timeout(JUP_FETCH_TIMEOUT_MS) });
   if (!res.ok) {
     const text = await res.text().catch(() => "<no-body>");
     throw new Error(`Jupiter quote ${res.status}: ${text}`);
@@ -111,6 +124,9 @@ export async function submitSwap(args: {
   userPublicKey: string;
 }): Promise<SubmitSwapResult> {
   const url = `${JUP_BASE}/swap`;
+  // Phase 10 (codex re-audit #7): see getQuote — same timeout pattern.
+  // /swap is more expensive than /quote (signs a tx server-side) so this
+  // hangs are more probable; the ceiling is the same.
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -119,6 +135,7 @@ export async function submitSwap(args: {
       userPublicKey: args.userPublicKey,
       wrapAndUnwrapSol: true,
     }),
+    signal: AbortSignal.timeout(JUP_FETCH_TIMEOUT_MS),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "<no-body>");
@@ -142,11 +159,14 @@ export async function submitSwap(args: {
   };
 }
 
-/** Outcome of a sign-and-send attempt, after the rebroadcast/confirm dance. */
+/** Outcome of a sign-and-send attempt, after the rebroadcast/confirm dance.
+ *  Phase 10: `not_landed` now carries `txid: string | null` to express the
+ *  pre-send abort case where we never broadcast — no txid exists in that
+ *  branch. The post-send/confirm-failed branches still carry a real txid. */
 export type SignAndSendResult =
   | { status: "ok"; txid: string }
   | { status: "failed_onchain"; txid: string; err: unknown }
-  | { status: "not_landed"; txid: string }
+  | { status: "not_landed"; txid: string | null; reason?: string }
   | { status: "landed_after_timeout"; txid: string; value: SignatureStatus };
 
 // citation: pattern adapted from Jupiter station-app reference
@@ -187,6 +207,19 @@ export async function signAndSend(
         { once: true },
       );
     }
+  }
+
+  // Phase 10 (codex re-audit #5): an already-aborted externalSignal must
+  // short-circuit BEFORE we broadcast. Without this guard, a /kill that
+  // tripped between policy approval and signAndSend entry would still leak
+  // one final tx onto the network. The previous post-send check at the
+  // bottom of the function caught the abort but only AFTER the tx was on
+  // the wire. txid=null on this path because we deliberately never sent.
+  if (abortController.signal.aborted) {
+    log.warn(
+      "signAndSend aborted via externalSignal BEFORE initial sendRawTransaction (pre-send guard)",
+    );
+    return { status: "not_landed", txid: null, reason: "aborted before send" };
   }
 
   const txid = await connection.sendRawTransaction(raw, {
@@ -369,7 +402,10 @@ export type ExecuteTradeResult =
     }
   | {
       status: "not_landed";
-      txid: string;
+      // Phase 10: pre-send abort path carries null — we never broadcast,
+      // so no signature exists. Post-send timeouts still carry the real txid.
+      txid: string | null;
+      reason?: string;
     }
   | {
       status: "landed_after_timeout";
@@ -527,7 +563,14 @@ export async function executeTrade(
         err: sendResult.err,
       };
     case "not_landed":
-      return { status: "not_landed", txid: sendResult.txid };
+      // Phase 10: pre-send-abort vs post-send-timeout look the same to the
+      // caller (both "we don't know"); preserve the optional reason string
+      // so logs distinguish the two.
+      return {
+        status: "not_landed",
+        txid: sendResult.txid,
+        reason: sendResult.reason,
+      };
     case "landed_after_timeout":
       return {
         status: "landed_after_timeout",

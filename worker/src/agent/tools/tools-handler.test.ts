@@ -163,6 +163,7 @@ function fakeLedger(): CapturedLedger {
       });
     },
     setPositionDecimals: () => {},
+    setPositionTokensReceived: () => {},
     closePosition: (tokenId) => {
       closePositionCalls.push(tokenId);
     },

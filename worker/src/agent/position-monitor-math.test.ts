@@ -154,12 +154,20 @@ type Position = {
   sizeSol: number;
   openedAt: number;
   decimals: number;
+  // Phase 10 (#1): persisted uint64 of tokens received at entry. Tests
+  // default to "1000000000" (1e9, plausible for a 9-decimal mint) so the
+  // backfill branch in position-monitor doesn't try to call into the spl-
+  // token mock for every test. Tests that exercise the backfill path
+  // explicitly override to "0".
+  tokensReceivedAtomic: string;
 };
 
 function fakeLedger(positions: Position[]): TradeLedger & {
   setDecimalsCalls: Array<{ tokenId: string; decimals: number }>;
+  setTokensReceivedCalls: Array<{ tokenId: string; atomic: bigint }>;
 } {
   const setDecimalsCalls: Array<{ tokenId: string; decimals: number }> = [];
+  const setTokensReceivedCalls: Array<{ tokenId: string; atomic: bigint }> = [];
   return {
     dbPath: ":memory:",
     recordTrade: () => ({ id: 1 }),
@@ -173,6 +181,11 @@ function fakeLedger(positions: Position[]): TradeLedger & {
       const row = positions.find((p) => p.tokenId === tokenId);
       if (row) row.decimals = decimals;
     },
+    setPositionTokensReceived: (tokenId, atomic) => {
+      setTokensReceivedCalls.push({ tokenId, atomic });
+      const row = positions.find((p) => p.tokenId === tokenId);
+      if (row) row.tokensReceivedAtomic = atomic.toString();
+    },
     closePosition: () => {},
     // Phase 7 H4: position-monitor never writes to phase_events; satisfy
     // the interface only.
@@ -180,6 +193,7 @@ function fakeLedger(positions: Position[]): TradeLedger & {
     recentPhaseEvents: () => [],
     close: () => {},
     setDecimalsCalls,
+    setTokensReceivedCalls,
   };
 }
 
@@ -254,6 +268,7 @@ describe("position-monitor price math (Phase 3)", () => {
           sizeSol: 0.05,
           openedAt: 0,
           decimals,
+          tokensReceivedAtomic: "0",
         },
       ];
       const ledger = fakeLedger(positions);
@@ -300,6 +315,7 @@ describe("position-monitor price math (Phase 3)", () => {
         sizeSol: 0.05,
         openedAt: 0,
         decimals: 6,
+        tokensReceivedAtomic: "0",
       },
     ];
     const ledger = fakeLedger(positions);
@@ -332,6 +348,7 @@ describe("position-monitor price math (Phase 3)", () => {
         sizeSol: 0.05,
         openedAt: 0,
         decimals: 6,
+        tokensReceivedAtomic: "0",
       },
     ];
     const ledger = fakeLedger(positions);
@@ -367,6 +384,7 @@ describe("position-monitor price math (Phase 3)", () => {
         sizeSol: 0.05,
         openedAt: 0,
         decimals: 6,
+        tokensReceivedAtomic: "0",
       },
     ];
     const ledger = fakeLedger(positions);
@@ -398,6 +416,7 @@ describe("position-monitor price math (Phase 3)", () => {
         sizeSol: 0.05,
         openedAt: 0,
         decimals: 6,
+        tokensReceivedAtomic: "0",
       },
     ];
     const ledger = fakeLedger(positions);
@@ -429,6 +448,7 @@ describe("position-monitor price math (Phase 3)", () => {
         sizeSol: 0.05,
         openedAt: 0,
         decimals: 6,
+        tokensReceivedAtomic: "0",
       },
     ];
     const ledger = fakeLedger(positions);
@@ -461,6 +481,7 @@ describe("position-monitor price math (Phase 3)", () => {
         entryPriceSolPerToken: 0.005,
         sizeSol: 0.05,
         openedAt: 0,
+        tokensReceivedAtomic: "0",
         decimals: 0, // triggers backfill
       },
     ];
@@ -496,6 +517,7 @@ describe("position-monitor price math (Phase 3)", () => {
         sizeSol: 0.05,
         openedAt: 0,
         decimals: 6,
+        tokensReceivedAtomic: "0",
       },
     ];
     const ledger = fakeLedger(positions);

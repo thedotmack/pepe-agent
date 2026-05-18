@@ -147,18 +147,25 @@ export function checkTradePolicy(
     };
   }
 
-  const last = ctx.ledger.lastTradeMs();
-  if (last !== null) {
-    const elapsed = ctx.now() - last;
-    if (elapsed < COOLDOWN_MS) {
-      const remainingSec = Math.max(
-        1,
-        Math.round((COOLDOWN_MS - elapsed) / 1000)
-      );
-      return {
-        allow: false,
-        reason: `cooldown active (${remainingSec}s remaining)`,
-      };
+  // Cooldown gates BUYs only — SELLs are emergency exits and must never be
+  // throttled by the per-trade cooldown. Mirrors the TANK_EMPTY / per-trade /
+  // daily-cap pattern: BUYs are capital-deployment events that benefit from
+  // rate-limiting; SELLs are risk-management events that must always be able
+  // to fire. Phase 10 (codex re-audit #13).
+  if (intent.side === "BUY") {
+    const last = ctx.ledger.lastTradeMs();
+    if (last !== null) {
+      const elapsed = ctx.now() - last;
+      if (elapsed < COOLDOWN_MS) {
+        const remainingSec = Math.max(
+          1,
+          Math.round((COOLDOWN_MS - elapsed) / 1000)
+        );
+        return {
+          allow: false,
+          reason: `cooldown active (${remainingSec}s remaining)`,
+        };
+      }
     }
   }
 
