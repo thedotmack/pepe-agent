@@ -369,3 +369,119 @@ describe("signAndSend confirmation paths (Phase 2)", () => {
     expect(CONFIRM_TIMEOUT_MS).toBeGreaterThan(REBROADCAST_INTERVAL_MS);
   }, 10_000);
 });
+
+describe("executeTrade route-liquidity gate (Phase 13 P13-T2)", () => {
+  // Phase 12 (codex Phase 11 re-audit blocker #2b) added a structural
+  // route-liquidity check on the AUTHORITATIVE /quote response inside
+  // executeTrade — the one we'd actually pass to /swap — before
+  // submitSwap. The handler's preview-quote gate is best-effort (a fresh
+  // /quote here may differ slightly), so this is the deny that
+  // guarantees no tx is signed and no lamports are burned on a no-route
+  // / high-impact quote, even if the preview happened to land in a
+  // healthy window.
+  //
+  // Phase 13 P13-T2 pins that contract with two cases:
+  //   (a) empty routePlan → status === "route_liquidity_denied"
+  //   (b) priceImpactPct above the 50% hard ceiling → same status
+  // In both cases /swap MUST NEVER be called (the structural deny
+  // happens BEFORE submitSwap). sendRawTransactionCalls also stays 0
+  // because we never sign anything.
+
+  it("empty routePlan: returns route_liquidity_denied; never calls /swap", async () => {
+    resetRpc();
+    // Drive the /quote response into the no-route branch. checkRouteLiquidity
+    // denies when routePlan is empty regardless of priceImpactPct.
+    quoteFixture.routePlan = [];
+    quoteFixture.priceImpactPct = "0.001";
+
+    // Track whether /swap was reached. The shared fetch mock dispatches by
+    // URL, so the no-route deny must short-circuit BEFORE submitSwap fires.
+    let swapCalls = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = typeof url === "string" ? url : url.toString();
+      // Jupiter URLs look like https://lite-api.jup.ag/swap/v1/{quote,swap}
+      // — the BASE path also contains "/swap", so a naive includes("/swap")
+      // would count the /quote call too. Match the trailing endpoint segment
+      // explicitly: a path ending in "/swap" (with optional query) is the
+      // /swap endpoint; "/swap/" is part of the base path and harmless.
+      if (/\/swap(\?|$)/.test(u)) {
+        swapCalls += 1;
+      }
+      return originalFetch(url, init);
+    }) as typeof fetch;
+
+    try {
+      const result = await executeTrade({
+        inputMint: SOL_MINT,
+        outputMint: TOKEN_MINT,
+        amountSol: 0.1,
+        slippageBps: 100,
+        decimals: 6,
+      });
+
+      expect(result.status).toBe("route_liquidity_denied");
+      if (result.status === "route_liquidity_denied") {
+        // The reason text comes from checkRouteLiquidity; the exact phrasing
+        // belongs to policy.ts but it MUST mention "route" so logs are
+        // self-documenting.
+        expect(result.reason).toMatch(/route/i);
+        // The denied quote is surfaced on the result for telemetry.
+        expect(result.quote).toBeDefined();
+        expect(result.quote.routePlan).toEqual([]);
+      }
+      // CRITICAL invariants: no /swap call, no signRawTransaction call.
+      // These are the load-bearing guarantees — a leak here would mean we
+      // signed and broadcast a real-money no-route quote.
+      expect(swapCalls).toBe(0);
+      expect(rpc.sendRawTransactionCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("priceImpactPct above hard ceiling: returns route_liquidity_denied; never calls /swap", async () => {
+    resetRpc();
+    // Phase 11 route-liquidity hard ceiling is 0.5 (50%). 0.99 is well
+    // above; the gate denies regardless of route count.
+    quoteFixture.routePlan = [{ swapInfo: { ammKey: "FakeRaydium" } }];
+    quoteFixture.priceImpactPct = "0.99";
+
+    let swapCalls = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = typeof url === "string" ? url : url.toString();
+      // Jupiter URLs look like https://lite-api.jup.ag/swap/v1/{quote,swap}
+      // — the BASE path also contains "/swap", so a naive includes("/swap")
+      // would count the /quote call too. Match the trailing endpoint segment
+      // explicitly: a path ending in "/swap" (with optional query) is the
+      // /swap endpoint; "/swap/" is part of the base path and harmless.
+      if (/\/swap(\?|$)/.test(u)) {
+        swapCalls += 1;
+      }
+      return originalFetch(url, init);
+    }) as typeof fetch;
+
+    try {
+      const result = await executeTrade({
+        inputMint: SOL_MINT,
+        outputMint: TOKEN_MINT,
+        amountSol: 0.1,
+        slippageBps: 100,
+        decimals: 6,
+      });
+
+      expect(result.status).toBe("route_liquidity_denied");
+      if (result.status === "route_liquidity_denied") {
+        // Reason mentions impact for log clarity. Exact phrasing owned by
+        // policy.ts — match loosely on "impact" or "price".
+        expect(result.reason).toMatch(/impact|price/i);
+        expect(result.quote.priceImpactPct).toBe("0.99");
+      }
+      expect(swapCalls).toBe(0);
+      expect(rpc.sendRawTransactionCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});

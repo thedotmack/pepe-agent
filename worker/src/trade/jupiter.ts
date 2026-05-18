@@ -34,6 +34,33 @@ import { getKeypair, getPublicKey } from "./wallet.ts";
 // handler's preview-quote gate was best-effort; this is the structural one.
 // Same module as the preview gate so policy stays single-source-of-truth.
 import { checkRouteLiquidity } from "./policy.ts";
+// Phase 13 (codex Phase 12 re-audit blocker): bound the SELL preflight
+// getAccount with the same 10s ceiling as position-monitor's backfill and
+// tools/index.ts's pre/post-BUY reads. spl-token has no overall-await
+// timeout, so a hung RPC would wedge the SELL path AFTER policy approval
+// but BEFORE we know whether the ATA holds enough. Local re-implementation
+// (rather than `import { withRpcTimeout } from "../agent/position-monitor.ts"`)
+// avoids the circular import — position-monitor.ts already imports
+// defaultRpcUrl + getQuote from this module. Same constant + primitive
+// (AbortSignal.timeout) as the position-monitor helper so an operator only
+// learns one number.
+const SELL_PREFLIGHT_RPC_TIMEOUT_MS = 10_000;
+function withSellPreflightTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+  return Promise.race([
+    operation,
+    new Promise<T>((_, reject) => {
+      const signal = AbortSignal.timeout(SELL_PREFLIGHT_RPC_TIMEOUT_MS);
+      signal.addEventListener(
+        "abort",
+        () =>
+          reject(
+            new Error(`${label} timeout after ${SELL_PREFLIGHT_RPC_TIMEOUT_MS}ms`),
+          ),
+        { once: true },
+      );
+    }),
+  ]);
+}
 
 const log = createLogger("trade.jupiter");
 
@@ -494,7 +521,18 @@ export async function executeTrade(
     const mintPk = new PublicKey(inputMint);
     const ata = getAssociatedTokenAddressSync(mintPk, ownerPk);
     try {
-      const acct = await getAccount(connection, ata);
+      // Phase 13 (codex Phase 12 re-audit blocker): bound the SELL preflight
+      // getAccount with a 10s timeout. spl-token has no overall-await
+      // timeout — a hung RPC would otherwise wedge the SELL path AFTER
+      // policy approval but BEFORE we know whether the ATA holds enough.
+      // On timeout: reuse the existing no_token_account variant (minimizes
+      // variant churn; the handler already treats it as a retryable
+      // failure). The reason string distinguishes "timeout" from "missing"
+      // for log/audit purposes.
+      const acct = await withSellPreflightTimeout(
+        getAccount(connection, ata),
+        `SELL preflight getAccount(${inputMint})`,
+      );
       if (acct.amount < args.sellAmountAtomic!) {
         // Phase 7 H1: ATA exists but doesn't hold enough — this is distinct
         // from a missing ATA. Distinguishing the two lets the handler
@@ -515,6 +553,21 @@ export async function executeTrade(
         return {
           status: "no_token_account",
           reason: `no ATA for mint ${inputMint} under owner ${userPublicKey}`,
+        };
+      }
+      // Phase 13: timeout falls through to here. Reuse no_token_account
+      // (rather than adding a preflight_timeout variant) — the handler
+      // already treats it as a retryable failure, so the agent will try
+      // again on its next turn once RPC recovers. Reason string includes
+      // "timeout" so /phase-events distinguishes this from a genuinely
+      // missing ATA for postmortem analysis.
+      if (err instanceof Error && /timeout after \d+ms/.test(err.message)) {
+        log.warn(
+          `SELL preflight getAccount timed out for mint ${inputMint}: ${err.message}`,
+        );
+        return {
+          status: "no_token_account",
+          reason: `SELL preflight getAccount timeout for mint ${inputMint}: ${err.message}`,
         };
       }
       throw err;

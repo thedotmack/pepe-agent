@@ -350,16 +350,43 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
         // BUY: decimals of tokenOut (the bought token).
         // SELL: decimals of tokenIn (the sold token == position mint).
         const mintForDecimals = side === "BUY" ? input.tokenOut : input.tokenIn;
-        const mintInfo = await getMint(rpc, new PublicKey(mintForDecimals));
+        // Phase 13 (codex Phase 12 re-audit blocker): bound the pre-trade
+        // getMint with the same 10s ceiling as position-monitor's backfill.
+        // Without this an unreachable RPC would wedge the trade handler
+        // BEFORE we sign — burning an agent turn on RPC weather. spl-token
+        // has no overall-await timeout, so we wrap via withRpcTimeout (same
+        // helper as the post-BUY ATA read + position-monitor's backfill so
+        // an operator only learns one number).
+        const mintInfo = await withRpcTimeout(
+          getMint(rpc, new PublicKey(mintForDecimals)),
+          `submit_trade getMint(${mintForDecimals})`,
+        );
         mintDecimals = mintInfo.decimals;
       } catch (err) {
-        log.error(`getMint failed for ${side} ${input.tokenIn}→${input.tokenOut}: ${String(err)}`);
-        stateStore.recordTradeResult(`mint-fetch-failed: ${String(err)}`, {
+        // Phase 13: timeout, mint-not-found, or any other RPC failure all
+        // converge here. Record decision PASS + trade-result with a
+        // dedicated outcome so /phase-events distinguishes "metadata
+        // unavailable, retry next turn" from a hard rejection. The agent
+        // retries on its next turn once RPC recovers — same fail-closed
+        // posture as the preview-quote gate.
+        log.warn(`getMint failed for ${side} ${input.tokenIn}→${input.tokenOut}: ${String(err)}`);
+        stateStore.recordDecision({
+          ts: Date.now(),
+          symbol: (side === "BUY" ? input.tokenOut : input.tokenIn).slice(0, 8),
+          action: "PASS",
+          reason: `mint metadata unavailable: ${String(err)}`,
+        });
+        stateStore.recordTradeResult(`mint metadata unavailable: ${String(err)}`, {
           side,
-          outcome: "mint_fetch_failed",
+          outcome: "denied_mint_metadata_timeout",
         });
         return {
-          content: [{ type: "text", text: `denied: could not fetch mint info: ${String(err)}` }],
+          content: [
+            {
+              type: "text",
+              text: `denied: mint metadata unavailable, retry: ${String(err)}`,
+            },
+          ],
           isError: true,
         };
       }

@@ -571,6 +571,150 @@ describe("submit_trade handler — Phase 7 H5 (float→atomic SELL conversion)",
     expect(delta <= tolerance).toBe(true);
   });
 
+  it("Phase 13 P13-T1: preview /quote throws → handler fails closed, no executeTrade call", async () => {
+    // Phase 12 (codex Phase 11 re-audit blocker #2a) added a fail-closed
+    // preview-quote gate at submit_trade entry: if the Jupiter /quote
+    // throws (Jupiter blip, network glitch, anything), the handler MUST
+    // deny the trade rather than fall through to executeTrade where the
+    // structural route-liquidity check could be bypassed.
+    //
+    // Phase 13 P13-T1 pins that behavior: force getQuoteImpl to throw
+    // before submitTrade.handler runs. Expect:
+    //   - executeTrade NEVER called (lastExecuteArgs stays null).
+    //   - Ledger trades empty (no row persisted).
+    //   - phaseEvents records outcome === "denied_preview_quote_unavailable"
+    //     (the exact string the handler emits).
+    //   - Tool result has isError:true so the agent narrates the denial
+    //     and retries on the next turn.
+    getQuoteImpl = async () => {
+      throw new Error("simulated jupiter outage");
+    };
+    let executeCalled = false;
+    executeTradeImpl = async () => {
+      executeCalled = true;
+      throw new Error("executeTrade should not run when preview quote fails");
+    };
+
+    const { tools, ledger, stateStore } = buildTools();
+    const result = await tools.submitTrade.handler(
+      buyInput({
+        tokenIn: SOL_MINT,
+        tokenOut: TOKEN_MINT,
+        amountSol: 0.05,
+        reason: "RISING signal but jupiter is down",
+      }),
+      undefined,
+    );
+
+    // The fail-closed contract: executeTrade is NEVER reached.
+    expect(executeCalled).toBe(false);
+    expect(lastExecuteArgs).toBeNull();
+
+    // No trade row persists on the fail-closed path — the denial happens
+    // BEFORE we sign and broadcast, so there's nothing to record.
+    expect(ledger.trades.length).toBe(0);
+    expect(ledger.openPositionCalls.length).toBe(0);
+    expect(ledger.closePositionCalls.length).toBe(0);
+
+    // phase_events captures the structured denial outcome. The exact
+    // outcome string is the handler's contract — if it changes, this test
+    // either updates with it OR we file a 12th-issue flag.
+    const final = stateStore.tradeResults[stateStore.tradeResults.length - 1];
+    expect(final.outcome).toBe("denied_preview_quote_unavailable");
+    expect(final.side).toBe("BUY");
+    expect(final.reason).toMatch(/simulated jupiter outage/);
+
+    // Tool result surfaces the denial so the agent narrates correctly.
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toMatch(
+      /preview quote unavailable/i,
+    );
+  });
+
+  it("Phase 13 P13-T3: post-BUY getAccount timeout → ledger persists 0n sentinel", async () => {
+    // Phase 12 (codex Phase 11 re-audit blocker #1) wrapped the post-BUY
+    // ATA read in withRpcTimeout and made readPostBuyDelta return 0n on
+    // ANY failure (timeout, TokenAccountNotFound, other). The 0n sentinel
+    // signals position-monitor's lazy backfill to recover the real value
+    // on its next tick, instead of persisting the slippage-corrupted
+    // quote.outAmount.
+    //
+    // Phase 13 P13-T3 pins that contract: when getAccountImpl throws
+    // (simulating a timeout / RPC blip), the BUY succeeds at the swap
+    // boundary but ledger.openPosition receives tokensReceivedAtomic=0n.
+    // We can't directly observe tokensReceivedAtomic via the captured
+    // openPositionCalls shape, so we extend the fake ledger inline.
+    executeTradeImpl = async () => ({
+      status: "ok",
+      txid: "tx-post-buy-timeout",
+      executedPriceSolPerToken: 0.0012,
+      quote: { inAmount: "100000000", outAmount: "5000000" } as never,
+    });
+    getAccountImpl = async () => {
+      throw new Error("simulated post-BUY getAccount timeout after 10000ms");
+    };
+
+    // Capture the full openPosition input (decimals + tokensReceivedAtomic)
+    // by intercepting via a custom ledger — the default fakeLedger only
+    // records a subset of fields. We mirror just enough to capture the
+    // sentinel.
+    let captured: { tokenId: string; tokensReceivedAtomic: bigint } | null = null;
+    const captureLedger: TradeLedger = {
+      dbPath: ":memory:",
+      recordTrade: () => ({ id: 1 }),
+      hasTradeTxid: () => false,
+      lastTradeMs: () => null,
+      dailyBuySolToday: () => 0,
+      openPositions: () => [],
+      openPosition: (input) => {
+        captured = {
+          tokenId: input.tokenId,
+          tokensReceivedAtomic: input.tokensReceivedAtomic ?? 999n,
+        };
+      },
+      setPositionDecimals: () => {},
+      setPositionTokensReceived: () => {},
+      closePosition: () => {},
+      recordPhaseEvent: () => {},
+      recentPhaseEvents: () => [],
+      close: () => {},
+    };
+    const tools = createPepeTools({
+      subscriber: fakeSubscriber(),
+      tradePolicyCheck: () => ({ allow: true }),
+      killSwitchRef: fakeKillSwitchRef(),
+      ledger: captureLedger,
+      memClient: fakeMemClient,
+      contentSessionId: "test-session",
+      stateStore: fakeStateStore(),
+    });
+
+    const result = await tools.submitTrade.handler(
+      buyInput({
+        tokenIn: SOL_MINT,
+        tokenOut: TOKEN_MINT,
+        amountSol: 0.1,
+        reason: "RISING signal — post-buy RPC blip",
+      }),
+      undefined,
+    );
+
+    // Swap succeeded — tool result is success-shaped.
+    expect(result.isError).toBeFalsy();
+    expect((result.content[0] as { text: string }).text).toContain(
+      "executed tx-post-buy-timeout",
+    );
+
+    // The CRITICAL assertion: tokensReceivedAtomic === 0n. This is the
+    // sentinel position-monitor's lazy backfill watches for. Persisting
+    // BigInt(quote.outAmount) here would silently store the slippage-
+    // corrupted quote promise and never backfill — losing slippage truth
+    // forever (backfill only fires on "0" rows).
+    expect(captured).not.toBeNull();
+    expect(captured!.tokenId).toBe(TOKEN_MINT);
+    expect(captured!.tokensReceivedAtomic).toBe(0n);
+  });
+
   it("UI rounds to 0 atomic: handler denies, no executeTrade call", async () => {
     // sellAmountTokens=1e-12 with decimals=9 → atomic floor = 0. The
     // handler must short-circuit with a structured denial, never call
