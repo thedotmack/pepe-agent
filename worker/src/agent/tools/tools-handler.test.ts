@@ -823,24 +823,24 @@ describe("submit_trade handler — Phase 14 P14-T1 (timeout coverage)", () => {
     );
   });
 
-  it("P14-T1 (P14-C2): claude-mem hang → recordTradeResult still fires before mem await", async () => {
-    // Phase 14 P14-C2 reordered the post-execute bookkeeping so
-    // recordTradeResult fires BEFORE the await memClient.recordObservation
-    // call. Previously a mem hang held TRADING phase set until state.ts's
-    // 90s safety timeout — this test pins the new ordering.
+  it("P15-T1 (P15-C1): claude-mem hang → handler returns PROMPTLY (fire-and-forget)", async () => {
+    // Phase 14 P14-C2 reordered so recordTradeResult fires BEFORE the mem
+    // call, so a mem hang no longer wedged TRADING phase. But the handler
+    // still AWAITED memClient.recordObservation, so a hanging mem daemon
+    // wedged the entire agent turn — the SDK never saw the tool_result and
+    // the LLM was stuck waiting on its own tool call.
+    //
+    // Phase 15 P15-C1 converted the recordObservation site to
+    // fire-and-forget (`void memClient.recordObservation(...).catch(...)`).
+    // The new invariant: the handler MUST return promptly even when mem is
+    // a black hole.
     //
     // Approach: wire a custom memClient whose recordObservation never
-    // resolves (hangs forever). The test waits for the swap-success
-    // promise to be in flight, then asserts recordTradeResult already
-    // fired. We can't await the submit_trade handler to completion
-    // because mem is hanging; instead we race the handler against a short
-    // deadline and check the side effect.
-    //
-    // The load-bearing observation is that stateStore.tradeResults has
-    // received the success entry BEFORE the handler returns. Because
-    // recordObservation is awaited LAST, the only way the trade-result
-    // entry is present is if it fired before the await — exactly the
-    // P14-C2 contract.
+    // resolves (hangs forever). Await the submit_trade handler with a
+    // short deadline; the handler must WIN the race because it's no longer
+    // awaiting mem. Then assert: mem was still called (the call site
+    // wasn't accidentally removed), AND recordTradeResult fired (P14-C2
+    // pin), AND the success entry is in tradeResults.
     executeTradeImpl = async () => ({
       status: "ok",
       txid: "tx-mem-hang",
@@ -856,7 +856,8 @@ describe("submit_trade handler — Phase 14 P14-T1 (timeout coverage)", () => {
       recordObservation: async () => {
         memCalled = true;
         // Hang forever — simulates a claude-mem daemon crash / network
-        // blackhole where the HTTP request never returns.
+        // blackhole where the HTTP request never returns. With P15
+        // fire-and-forget, this hang is detached from the handler.
         return await new Promise<never>(() => {});
       },
       summarize: async () => ({}),
@@ -879,9 +880,9 @@ describe("submit_trade handler — Phase 14 P14-T1 (timeout coverage)", () => {
       stateStore,
     });
 
-    // Fire the handler but don't await it — it will hang on the mem
-    // recordObservation call. Race it against a short deadline; we expect
-    // the deadline to win because the handler is stuck on mem.
+    // Fire the handler and race it against a generous deadline. With
+    // P15 fire-and-forget, the handler MUST resolve promptly — mem hang
+    // is no longer on the critical path.
     const handlerPromise = tools.submitTrade.handler(
       buyInput({
         tokenIn: SOL_MINT,
@@ -893,35 +894,42 @@ describe("submit_trade handler — Phase 14 P14-T1 (timeout coverage)", () => {
     );
 
     const DEADLINE_SENTINEL = Symbol("deadline");
+    const HANDLER_DEADLINE_MS = 1000;
     const winner = await Promise.race([
-      handlerPromise.then(() => "handler-returned" as const),
+      handlerPromise.then((res) => ({ kind: "handler" as const, res })),
       new Promise<typeof DEADLINE_SENTINEL>((r) =>
-        setTimeout(() => r(DEADLINE_SENTINEL), 250),
+        setTimeout(() => r(DEADLINE_SENTINEL), HANDLER_DEADLINE_MS),
       ),
     ]);
 
-    // The handler MUST still be in flight (blocked on mem). If it
-    // returned, the new ordering is wrong (mem must be the LAST hop) or
-    // the hangingMemClient isn't hanging. Either way this assertion fails
-    // loudly.
-    expect(winner).toBe(DEADLINE_SENTINEL);
-    // Mem WAS called — proves we reached the recordObservation line.
+    // CRITICAL P15-C1 assertion: handler won the race. If the deadline
+    // wins, the fire-and-forget conversion regressed and the handler is
+    // again blocking on the mem hang.
+    expect(winner).not.toBe(DEADLINE_SENTINEL);
+    if (winner === DEADLINE_SENTINEL) {
+      // Type narrow for the rest of the assertions; never reached on
+      // success.
+      return;
+    }
+    const handlerResult = winner.res;
+    expect(handlerResult.isError).not.toBe(true);
+    expect((handlerResult.content[0] as { text: string }).text).toMatch(
+      /^executed tx-mem-hang/,
+    );
+
+    // Mem WAS called — proves the call site wasn't accidentally removed
+    // alongside the await. The recordObservation invocation still happens,
+    // it just isn't awaited.
     expect(memCalled).toBe(true);
 
-    // The CRITICAL P14-C2 assertion: recordTradeResult fired BEFORE the
-    // mem hang. Without the reorder, this list would be empty (handler
-    // never reached recordTradeResult because mem swallowed the await).
-    // With the reorder, the success entry is there even though mem is
-    // still hanging.
+    // P14-C2 pin: recordTradeResult fired (TRADING → WATCHING) before
+    // the handler returned. This is downstream of P15 but still part of
+    // the same contract — the handler completed bookkeeping fully.
     const final = stateStore.tradeResults[stateStore.tradeResults.length - 1];
     expect(final).toBeDefined();
     expect(final.outcome).toBe("ok");
     expect(final.txid).toBe("tx-mem-hang");
     expect(final.side).toBe("BUY");
-    // TRADING phase must have flipped back to WATCHING via the
-    // recordTradeResult side effect (fakeStateStore mirrors prod behavior:
-    // TRADING → WATCHING on recordTradeResult). If recordTradeResult
-    // hadn't fired, the snapshot phase would still be TRADING.
     expect(stateStore.snapshot().phase).not.toBe("TRADING");
   });
 });

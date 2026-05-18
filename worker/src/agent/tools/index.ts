@@ -935,18 +935,26 @@ export function createPepeTools(args: CreatePepeMcpServerArgs) {
       // Record the decision in claude-mem so future sessions see it
       // (plan Phase 4 step 5, line 388). Runs AFTER recordTradeResult per
       // P14-C2 — mem can hang or fail without blocking phase clearance.
-      try {
-        await memClient.recordObservation({
+      //
+      // Phase 15 (codex Phase 14 re-audit critical blocker): fire-and-forget.
+      // P14-C2 reordered so recordTradeResult fires first, but the handler
+      // still AWAITED recordObservation — meaning a hanging mem daemon would
+      // wedge the entire agent turn (the tool call never returns to the
+      // SDK, which means the LLM never gets a tool_result, which means the
+      // turn is stuck until the SDK's own timeout, if any). The mem write
+      // is best-effort telemetry, never on a correctness path; detach it.
+      void memClient
+        .recordObservation({
           contentSessionId,
           tool_name: "trade-executed",
           tool_input: JSON.stringify({ ...intent, side, sellAmountTokens: input.sellAmountTokens }),
           tool_response: JSON.stringify({ txid, executedPriceSolPerToken, side }),
           cwd: process.cwd(),
           platformSource: "pepe-agent-worker",
+        })
+        .catch((err) => {
+          log.warn(`claude-mem record failed (non-fatal): ${String(err)}`);
         });
-      } catch (err) {
-        log.warn(`claude-mem record failed (non-fatal): ${String(err)}`);
-      }
 
       return {
         content: [{ type: "text", text: `executed ${txid}` }],
